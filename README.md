@@ -6,6 +6,8 @@ It reads an originals directory, creates a separate static website with square
 thumbnails and medium previews, and links directly back to the original files.
 The source tree is never modified.
 
+![slopware warning](https://brontosaurusrex.github.io/media/slopware02.svg)
+
 ## Version 0.1.4
 
 This version provides:
