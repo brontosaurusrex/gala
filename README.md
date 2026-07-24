@@ -6,31 +6,34 @@ It reads an originals directory, creates a separate static website with square
 thumbnails and medium previews, and links directly back to the original files.
 The source tree is never modified.
 
-## Version 0.1.1
+## Version 0.1.3
 
-This first version provides:
+This version provides:
 
 - one generated `index.html` per source directory;
 - stable folder covers chosen from the first usable descendant image;
-- visibly different folder cards;
+- folder cards identified by a folder icon without a special border;
 - square, center-cropped thumbnails;
 - previews with a maximum dimension of 1920 pixels by default;
-- a compact breadcrumb heading without a separate branded header;
-- a keyboard, mouse, and touch lightbox that contains the complete image without cropping;
-- left/right navigation by clicking the corresponding side of the lightbox;
+- native previews for JPEG, PNG, and the first frame of GIF files;
+- MP4/MOV/M4V/WebM/MKV thumbnails through `ffmpeg`, marked by a simple play icon;
+- native browser video playback in the lightbox using the original file, so
+  Gala does not create a redundant medium-sized video still;
+- first-page PDF thumbnails through `pdftocairo`;
+- centered breadcrumb headings without a separate branded page header;
+- a keyboard, mouse, and touch lightbox that fits the complete preview without cropping;
+- lightbox navigation by clicking the left or right side;
+- clicking the top area of the lightbox closes it;
+- previous/next controls disappear at the first and last item, with no wrap-around;
 - a bottom click area that reveals the filename and original download link;
-- direct links for all non-image files;
-- parallel image processing;
-- an incremental manifest, so unchanged images are not regenerated;
+- a footer credit that stays hidden until the footer is hovered;
+- direct links for files without previews;
+- parallel media processing;
+- an incremental manifest, so unchanged previews are not regenerated;
+- cache-busting URLs for generated CSS, JavaScript, thumbnails, and previews;
 - deletion of stale generated pages and media assets;
 - a lock file to prevent overlapping cron builds;
-- JPEG EXIF-orientation correction;
-- no runtime dependencies beyond Go for building the executable.
-
-Native preview generation currently supports JPEG, PNG, and the first frame of
-GIF files. Other files, including RAW, PDF, video, text, archives, and unknown
-formats, are listed and linked to their originals but do not yet receive visual
-previews. Those handlers are intended for the next version.
+- JPEG EXIF-orientation correction.
 
 ## Build
 
@@ -45,6 +48,18 @@ Install for the current user:
 ```sh
 install -Dm755 gala "$HOME/.local/bin/gala"
 ```
+
+## Optional preview helpers
+
+Normal images need no external runtime dependency. Install these to generate
+video and PDF previews:
+
+```sh
+sudo apt install ffmpeg poppler-utils
+```
+
+When either helper is absent or a file cannot be rendered, Gala keeps that file
+as an ordinary direct link and continues building the rest of the site.
 
 ## Use
 
@@ -98,7 +113,7 @@ An original at `/srv/photos/trips/alps.jpg` then receives the URL:
 ## Useful options
 
 ```text
--j, --workers N        parallel image workers
+-j, --workers N        parallel media workers
 --thumb-size N         square thumbnail dimension; default 320
 --preview-size N       maximum preview dimension; default 1920
 --original-url URL     public URL prefix for originals
@@ -114,7 +129,7 @@ Absolute paths are recommended under cron:
 */5 * * * * /home/b/.local/bin/gala /var/www/originals /var/www/gala-site >>/var/log/gala.log 2>&1
 ```
 
-Each run scans the complete directory tree but regenerates expensive image
+Each run scans the complete directory tree but regenerates expensive media
 assets only when the source size or modification time has changed. HTML pages
 are inexpensive and are rebuilt each time.
 

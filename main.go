@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -28,10 +30,14 @@ import (
 	"time"
 )
 
-const version = "0.1.1"
+const version = "0.1.3"
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
+}
+
+var videoExtensions = map[string]bool{
+	".mp4": true, ".m4v": true, ".mov": true, ".webm": true, ".mkv": true,
 }
 
 type Options struct {
@@ -46,14 +52,16 @@ type Options struct {
 }
 
 type ScanFile struct {
-	Rel     string
-	Abs     string
-	DirRel  string
-	Name    string
-	Ext     string
-	Size    int64
-	ModNano int64
-	IsImage bool
+	Rel           string
+	Abs           string
+	DirRel        string
+	Name          string
+	Ext           string
+	Size          int64
+	ModNano       int64
+	IsImage       bool
+	IsPreviewable bool
+	Kind          string
 }
 
 type Manifest struct {
@@ -113,6 +121,8 @@ type ImageCard struct {
 	OriginalURL string
 	Width       int
 	Height      int
+	Kind        string
+	Badge       string
 }
 
 type FileCard struct {
@@ -248,7 +258,7 @@ Examples:
 
 Options:
   -o, --output DIR       Output directory (default: ./gala-site)
-  -j, --workers N        Parallel image workers (default: up to 4)
+  -j, --workers N        Parallel media workers (default: up to 4)
       --thumb-size N     Square thumbnail size (default: 320)
       --preview-size N   Maximum preview dimension (default: 1920)
       --original-url URL Public URL prefix for originals
@@ -296,30 +306,35 @@ func run(opts Options) error {
 		oldManifest.Images = make(map[string]ManifestImage)
 	}
 
-	imageFiles := make([]ScanFile, 0)
+	previewFiles := make([]ScanFile, 0)
 	for _, f := range files {
-		if f.IsImage {
-			imageFiles = append(imageFiles, f)
+		if f.IsPreviewable {
+			previewFiles = append(previewFiles, f)
 		}
 	}
 
 	jobs := make([]imageJob, 0)
-	newImages := make(map[string]ManifestImage, len(imageFiles))
-	cacheCompatible := oldManifest.ThumbSize == opts.ThumbSize && oldManifest.PreviewSize == opts.PreviewSize
-	for _, f := range imageFiles {
+	newImages := make(map[string]ManifestImage, len(previewFiles))
+	for _, f := range previewFiles {
 		old, ok := oldManifest.Images[f.Rel]
+		cacheCompatible := oldManifest.ThumbSize == opts.ThumbSize &&
+			(f.Kind == "video" || oldManifest.PreviewSize == opts.PreviewSize)
 		unchanged := cacheCompatible && ok && old.Size == f.Size && old.ModNano == f.ModNano &&
-			fileExists(filepath.Join(output, filepath.FromSlash(old.Thumb))) &&
-			fileExists(filepath.Join(output, filepath.FromSlash(old.Preview)))
+			manifestAssetsExist(output, f.Kind, old)
 		if unchanged && !opts.Force {
+			// Gala 0.1.2 generated a medium still for videos. Videos now use only
+			// the thumbnail; the original file is played directly in the lightbox.
+			if f.Kind == "video" {
+				old.Preview = ""
+			}
 			newImages[f.Rel] = old
 		} else {
 			jobs = append(jobs, imageJob{File: f, Old: old})
 		}
 	}
 
-	fmt.Printf("Gala: %d directories, %d files, %d images, %d image%s to process\n",
-		len(dirs), len(files), len(imageFiles), len(jobs), plural(len(jobs)))
+	fmt.Printf("Gala: %d directories, %d files, %d previewable media, %d item%s to process\n",
+		len(dirs), len(files), len(previewFiles), len(jobs), plural(len(jobs)))
 	if opts.DryRun {
 		fmt.Printf("Dry run: output would be written to %s\n", output)
 		return nil
@@ -353,7 +368,7 @@ func run(opts Options) error {
 		return err
 	}
 
-	folderCover := chooseFolderCovers(dirs, imageFiles, newImages)
+	folderCover := chooseFolderCovers(dirs, files, newImages)
 	pages, err := writePages(source, output, opts, dirs, files, newImages, folderCover)
 	if err != nil {
 		return err
@@ -362,7 +377,7 @@ func run(opts Options) error {
 	cleanupStale(output, oldManifest, newImages, pages)
 
 	manifest := Manifest{
-		Version:     2,
+		Version:     4,
 		Source:      source,
 		ThumbSize:   opts.ThumbSize,
 		PreviewSize: opts.PreviewSize,
@@ -376,7 +391,7 @@ func run(opts Options) error {
 
 	fmt.Printf("Built %d page%s in %s", len(pages), plural(len(pages)), output)
 	if failures > 0 {
-		fmt.Printf(" (%d image warning%s)", failures, plural(failures))
+		fmt.Printf(" (%d media warning%s)", failures, plural(failures))
 	}
 	fmt.Println()
 	return nil
@@ -457,9 +472,22 @@ func scanTree(source string) (map[string]*dirData, []ScanFile, error) {
 			dirRel = ""
 		}
 		ext := strings.ToLower(filepath.Ext(name))
+		kind := "file"
+		isImage := imageExtensions[ext]
+		isPreviewable := isImage
+		if isImage {
+			kind = "image"
+		} else if videoExtensions[ext] {
+			kind = "video"
+			isPreviewable = true
+		} else if ext == ".pdf" {
+			kind = "pdf"
+			isPreviewable = true
+		}
 		f := ScanFile{
 			Rel: rel, Abs: path, DirRel: dirRel, Name: name, Ext: ext,
-			Size: info.Size(), ModNano: info.ModTime().UnixNano(), IsImage: imageExtensions[ext],
+			Size: info.Size(), ModNano: info.ModTime().UnixNano(),
+			IsImage: isImage, IsPreviewable: isPreviewable, Kind: kind,
 		}
 		files = append(files, f)
 		dirs[dirRel].Files = append(dirs[dirRel].Files, f)
@@ -529,40 +557,43 @@ func processImages(jobs []imageJob, output string, opts Options) <-chan imageRes
 }
 
 func generateImageAssets(f ScanFile, output string, opts Options) (ManifestImage, error) {
-	in, err := os.Open(f.Abs)
+	img, format, err := decodePreviewSource(f, output, opts.PreviewSize)
 	if err != nil {
 		return ManifestImage{}, err
 	}
-	img, format, err := image.Decode(in)
-	_ = in.Close()
-	if err != nil {
-		return ManifestImage{}, fmt.Errorf("decode: %w", err)
-	}
 
 	orientation := 1
-	if f.Ext == ".jpg" || f.Ext == ".jpeg" {
+	if f.IsImage && (f.Ext == ".jpg" || f.Ext == ".jpeg") {
 		orientation = jpegOrientation(f.Abs)
 	}
 	img = orientImage(img, orientation)
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	if width < 1 || height < 1 {
-		return ManifestImage{}, errors.New("empty image")
+		return ManifestImage{}, errors.New("empty preview image")
 	}
 
 	id := shortHash(f.Rel)
 	thumbRel := filepath.ToSlash(filepath.Join("_gala", "thumbs", id+".jpg"))
 	previewRel := filepath.ToSlash(filepath.Join("_gala", "previews", id+".jpg"))
 	thumbAbs := filepath.Join(output, filepath.FromSlash(thumbRel))
-	previewAbs := filepath.Join(output, filepath.FromSlash(previewRel))
 
 	src := toNRGBA(img)
 	thumb := makeSquareThumb(src, opts.ThumbSize)
-	preview := makePreview(src, opts.PreviewSize)
 
 	if err := writeJPEGAtomic(thumbAbs, thumb, 84); err != nil {
 		return ManifestImage{}, err
 	}
+
+	if f.Kind == "video" {
+		return ManifestImage{
+			Size: f.Size, ModNano: f.ModNano, Thumb: thumbRel,
+			Width: width, Height: height, SourceType: format,
+		}, nil
+	}
+
+	previewAbs := filepath.Join(output, filepath.FromSlash(previewRel))
+	preview := makePreview(src, opts.PreviewSize)
 	if err := writeJPEGAtomic(previewAbs, preview, 87); err != nil {
 		return ManifestImage{}, err
 	}
@@ -571,6 +602,102 @@ func generateImageAssets(f ScanFile, output string, opts Options) (ManifestImage
 		Size: f.Size, ModNano: f.ModNano, Thumb: thumbRel, Preview: previewRel,
 		Width: width, Height: height, SourceType: format,
 	}, nil
+}
+
+func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Image, string, error) {
+	if f.IsImage {
+		in, err := os.Open(f.Abs)
+		if err != nil {
+			return nil, "", err
+		}
+		defer in.Close()
+		img, format, err := image.Decode(in)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode: %w", err)
+		}
+		return img, format, nil
+	}
+
+	tmpDir, err := os.MkdirTemp(filepath.Join(output, "_gala"), ".render-*")
+	if err != nil {
+		return nil, "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var rendered string
+	var sourceType string
+	switch f.Kind {
+	case "video":
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			return nil, "", errors.New("ffmpeg is required for video previews")
+		}
+		rendered = filepath.Join(tmpDir, "frame.jpg")
+		args := []string{
+			"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+			"-i", f.Abs,
+			"-vf", "thumbnail=100",
+			"-frames:v", "1", "-q:v", "2", rendered,
+		}
+		if err := runExternal(3*time.Minute, "ffmpeg", args...); err != nil {
+			fallback := []string{
+				"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+				"-ss", "1", "-i", f.Abs,
+				"-frames:v", "1", "-q:v", "2", rendered,
+			}
+			if fallbackErr := runExternal(3*time.Minute, "ffmpeg", fallback...); fallbackErr != nil {
+				return nil, "", fmt.Errorf("ffmpeg thumbnail: %v; fallback: %w", err, fallbackErr)
+			}
+		}
+		sourceType = "video/" + strings.TrimPrefix(f.Ext, ".")
+
+	case "pdf":
+		if _, err := exec.LookPath("pdftocairo"); err != nil {
+			return nil, "", errors.New("pdftocairo is required for PDF previews")
+		}
+		prefix := filepath.Join(tmpDir, "page")
+		rendered = prefix + ".png"
+		args := []string{
+			"-f", "1", "-l", "1", "-singlefile", "-png",
+			"-scale-to", strconv.Itoa(previewSize),
+			f.Abs, prefix,
+		}
+		if err := runExternal(2*time.Minute, "pdftocairo", args...); err != nil {
+			return nil, "", fmt.Errorf("pdftocairo: %w", err)
+		}
+		sourceType = "application/pdf"
+
+	default:
+		return nil, "", fmt.Errorf("unsupported preview type %q", f.Kind)
+	}
+
+	in, err := os.Open(rendered)
+	if err != nil {
+		return nil, "", fmt.Errorf("open rendered preview: %w", err)
+	}
+	defer in.Close()
+	img, _, err := image.Decode(in)
+	if err != nil {
+		return nil, "", fmt.Errorf("decode rendered preview: %w", err)
+	}
+	return img, sourceType, nil
+}
+
+func runExternal(timeout time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("timed out after %s", timeout)
+	}
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return err
+		}
+		return fmt.Errorf("%w: %s", err, message)
+	}
+	return nil
 }
 
 func shortHash(s string) string {
@@ -756,8 +883,8 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 
 		data := PageData{
 			Title: sourceName, SourceName: sourceName,
-			CSSURL:      webRel(pageDir, filepath.Join(output, "_gala", "gala.css")),
-			JSURL:       webRel(pageDir, filepath.Join(output, "_gala", "gala.js")),
+			CSSURL:      withVersion(webRel(pageDir, filepath.Join(output, "_gala", "gala.css")), version),
+			JSURL:       withVersion(webRel(pageDir, filepath.Join(output, "_gala", "gala.js")), version),
 			GeneratedAt: time.Now().Format("2006-01-02 15:04"),
 		}
 		if rel != "" {
@@ -775,7 +902,7 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 			if coverRel, ok := covers[childRel]; ok {
 				if entry, ok := images[coverRel]; ok {
 					fc.HasThumb = true
-					fc.ThumbURL = webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb)))
+					fc.ThumbURL = withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), cacheToken(entry, opts))
 				}
 			}
 			data.Folders = append(data.Folders, fc)
@@ -783,13 +910,25 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 
 		for _, f := range d.Files {
 			original := originalLink(opts, source, output, pageDir, f.Rel)
-			if f.IsImage {
+			if f.IsPreviewable {
 				if entry, ok := images[f.Rel]; ok {
+					badge := ""
+					if f.Kind == "video" {
+						badge = "▶"
+					} else if f.Kind == "pdf" {
+						badge = "PDF"
+					}
+					token := cacheToken(entry, opts)
+					previewURL := original
+					if f.Kind != "video" {
+						previewURL = withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token)
+					}
 					data.Images = append(data.Images, ImageCard{
 						Name: f.Name, OriginalURL: original,
-						ThumbURL:   webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))),
-						PreviewURL: webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))),
+						ThumbURL:   withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), token),
+						PreviewURL: previewURL,
 						Width:      entry.Width, Height: entry.Height,
+						Kind: f.Kind, Badge: badge,
 					})
 					continue
 				}
@@ -846,6 +985,22 @@ func webRel(fromDir, target string) string {
 		return filepath.ToSlash(target)
 	}
 	return escapeRelURL(filepath.ToSlash(rel))
+}
+
+func withVersion(rawURL, token string) string {
+	if token == "" {
+		return rawURL
+	}
+	separator := "?"
+	if strings.Contains(rawURL, "?") {
+		separator = "&"
+	}
+	return rawURL + separator + "v=" + url.QueryEscape(token)
+}
+
+func cacheToken(entry ManifestImage, opts Options) string {
+	return version + "-" + strconv.FormatInt(entry.ModNano, 36) + "-" + strconv.FormatInt(entry.Size, 36) +
+		"-t" + strconv.Itoa(opts.ThumbSize) + "-p" + strconv.Itoa(opts.PreviewSize)
 }
 
 func escapeRelURL(rel string) string {
@@ -939,10 +1094,10 @@ func writeBytesAtomic(path string, b []byte, mode fs.FileMode) error {
 func cleanupStale(output string, old Manifest, current map[string]ManifestImage, pages []string) {
 	for rel, entry := range old.Images {
 		newEntry, ok := current[rel]
-		if !ok || newEntry.Thumb != entry.Thumb {
+		if entry.Thumb != "" && (!ok || newEntry.Thumb != entry.Thumb) {
 			_ = os.Remove(filepath.Join(output, filepath.FromSlash(entry.Thumb)))
 		}
-		if !ok || newEntry.Preview != entry.Preview {
+		if entry.Preview != "" && (!ok || newEntry.Preview != entry.Preview) {
 			_ = os.Remove(filepath.Join(output, filepath.FromSlash(entry.Preview)))
 		}
 	}
@@ -975,6 +1130,16 @@ func removeEmptyDirs(root string) {
 func fileExists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir() && st.Size() > 0
+}
+
+func manifestAssetsExist(output, kind string, entry ManifestImage) bool {
+	if entry.Thumb == "" || !fileExists(filepath.Join(output, filepath.FromSlash(entry.Thumb))) {
+		return false
+	}
+	if kind == "video" {
+		return true
+	}
+	return entry.Preview != "" && fileExists(filepath.Join(output, filepath.FromSlash(entry.Preview)))
 }
 
 // jpegOrientation reads the EXIF Orientation tag without pulling in a dependency.
@@ -1141,12 +1306,12 @@ const pageTemplate = `<!doctype html>
   {{end}}
 
   {{if .Images}}
-  <section aria-labelledby="images-heading">
-    <h2 id="images-heading">Images</h2>
+  <section aria-labelledby="media-heading">
+    <h2 id="media-heading">Media</h2>
     <div class="grid image-grid">
       {{range .Images}}
-      <a class="card media-card" href="{{.PreviewURL}}" data-preview="{{.PreviewURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}">
-        <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy"></div>
+      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-preview="{{.PreviewURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}">
+        <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>
       </a>
       {{end}}
@@ -1172,15 +1337,16 @@ const pageTemplate = `<!doctype html>
   {{if .Empty}}<p class="empty">This folder is empty.</p>{{end}}
 </main>
 
-<footer>Generated by Gala · {{.GeneratedAt}}</footer>
+<footer><span>Generated by Gala · {{.GeneratedAt}}</span></footer>
 
 <div class="lightbox" id="lightbox" hidden aria-hidden="true">
   <button class="close" type="button" aria-label="Close">×</button>
-  <button class="nav prev" type="button" aria-label="Previous">‹</button>
-  <div class="lightbox-stage">
+  <button class="nav prev" type="button" aria-label="Previous" {{if lt (len .Images) 2}}hidden{{end}}>‹</button>
+  <div class="lightbox-stage" title="Click the top area to close">
     <img class="lightbox-image" alt="">
+    <video class="lightbox-video" controls preload="metadata" hidden></video>
   </div>
-  <button class="nav next" type="button" aria-label="Next">›</button>
+  <button class="nav next" type="button" aria-label="Next" {{if lt (len .Images) 2}}hidden{{end}}>›</button>
   <div class="lightbox-info" hidden>
     <div><strong class="lightbox-name"></strong><span class="lightbox-dimensions"></span></div>
     <a class="download-link" href="" download>Download original</a>
@@ -1199,13 +1365,14 @@ const galaCSS = `:root {
   --accent: #e9b44c;
   --folder: #4f9ddf;
   --gap: clamp(.75rem, 2vw, 1.25rem);
+  --info-height: 0px;
 }
 * { box-sizing: border-box; }
 html { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
 body { margin: 0; min-height: 100vh; }
 a { color: inherit; text-decoration: none; }
 .site-header { position: sticky; top: 0; z-index: 10; padding: 1rem clamp(1rem, 4vw, 3rem); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid #ffffff12; }
-.breadcrumbs { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: clamp(1.15rem, 2.5vw, 1.65rem); font-weight: 650; line-height: 1.25; }
+.breadcrumbs { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; color: var(--muted); font-size: clamp(1.05rem, 2.2vw, 1.45rem); font-weight: 650; line-height: 1.25; }
 .breadcrumbs a:hover { color: var(--text); }
 .breadcrumbs [aria-current="page"] { color: var(--text); }
 .separator { padding: 0 .4rem; opacity: .4; font-weight: 400; }
@@ -1214,13 +1381,15 @@ h2 { margin: 2rem 0 .9rem; color: var(--muted); font-size: .8rem; letter-spacing
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: var(--gap); }
 .card { min-width: 0; overflow: hidden; border: 1px solid #ffffff12; border-radius: 14px; background: var(--panel); transition: transform .15s ease, border-color .15s ease; }
 .card:hover { transform: translateY(-3px); border-color: #ffffff40; }
-.folder-card { border-color: color-mix(in srgb, var(--folder) 60%, transparent); }
 .thumb { position: relative; aspect-ratio: 1; overflow: hidden; background: var(--panel-2); }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.folder-thumb::after { content: ""; position: absolute; inset: 0; box-shadow: inset 0 0 0 4px color-mix(in srgb, var(--folder) 70%, transparent); pointer-events: none; }
 .folder-placeholder { display: grid; place-items: center; width: 100%; height: 100%; font-size: 5rem; font-weight: 900; color: #ffffff14; }
-.folder-badge { position: absolute; right: .65rem; bottom: .65rem; display: grid; place-items: center; width: 2.3rem; height: 2.3rem; border-radius: 999px; background: var(--folder); box-shadow: 0 6px 18px #0008; }
+.folder-badge, .media-badge { position: absolute; right: .65rem; bottom: .65rem; display: grid; place-items: center; min-width: 2.3rem; height: 2.3rem; padding: 0 .55rem; border-radius: 999px; box-shadow: 0 6px 18px #0008; color: white; font: 800 .7rem system-ui, sans-serif; }
+.folder-badge { width: 2.3rem; padding: 0; background: var(--folder); }
 .folder-badge svg { width: 1.35rem; fill: white; }
+.media-badge { background: #10131ad9; border: 1px solid #ffffff35; backdrop-filter: blur(5px); }
+.video .media-badge { min-width: auto; height: auto; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; backdrop-filter: none; font-size: 2rem; line-height: 1; text-shadow: 0 4px 12px #000; }
+.pdf .media-badge { color: #ffb2aa; }
 .card-text { padding: .75rem .85rem .9rem; display: grid; gap: .2rem; }
 .card-text strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .92rem; }
 .card-text span { color: var(--muted); font-size: .78rem; }
@@ -1231,14 +1400,20 @@ h2 { margin: 2rem 0 .9rem; color: var(--muted); font-size: .8rem; letter-spacing
 .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-size { color: var(--muted); font-size: .8rem; }
 .empty { color: var(--muted); }
-footer { padding: 2rem; text-align: center; color: var(--muted); font-size: .75rem; }
+footer { min-height: 4.75rem; padding: 2rem; text-align: center; color: var(--muted); font-size: .75rem; }
+footer span { opacity: 0; transition: opacity .18s ease; }
+footer:hover span { opacity: 1; }
 .lightbox { position: fixed; inset: 0; z-index: 100; background: #050609f5; }
 .lightbox[hidden] { display: none; }
-.lightbox-stage { position: absolute; inset: 0; display: grid; place-items: center; overflow: hidden; padding: 3.5rem 4.5rem 6.5rem; cursor: pointer; }
-.lightbox-image { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 20px 80px #000; user-select: none; }
+.lightbox-stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 4rem 4.5rem 1rem; cursor: pointer; transition: bottom .15s ease; }
+.lightbox.info-open .lightbox-stage { bottom: var(--info-height); }
+.lightbox-image, .lightbox-video { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 55px #000); user-select: none; -webkit-user-drag: none; }
+.lightbox-image[hidden], .lightbox-video[hidden] { display: none; }
+.lightbox-video { background: #000; cursor: default; }
 .close, .nav { position: absolute; z-index: 3; border: 0; color: white; background: #0007; cursor: pointer; }
-.close { right: 1rem; top: 1rem; width: 2.7rem; height: 2.7rem; border-radius: 50%; font-size: 2rem; line-height: 1; }
+.close { right: .75rem; top: .75rem; width: 3.2rem; height: 3.2rem; border-radius: 50%; font-size: 2.2rem; line-height: 1; }
 .nav { top: 45%; width: 3rem; height: 4rem; font-size: 3rem; border-radius: 9px; }
+.nav[hidden] { display: none; }
 .prev { left: .7rem; }
 .next { right: .7rem; }
 .lightbox-info { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem clamp(1rem, 4vw, 3rem); background: #10131aeb; border-top: 1px solid #ffffff20; }
@@ -1249,7 +1424,7 @@ footer { padding: 2rem; text-align: center; color: var(--muted); font-size: .75r
 .download-link { flex: none; padding: .7rem 1rem; border-radius: 8px; background: var(--accent); color: #17120a; font-weight: 750; }
 @media (max-width: 640px) {
   .grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  .lightbox-stage { padding: 3rem .5rem 8.5rem; }
+  .lightbox-stage { padding: 3.75rem .5rem .5rem; }
   .nav { display: none; }
   .lightbox-info { align-items: stretch; flex-direction: column; }
   .download-link { text-align: center; }
@@ -1262,27 +1437,77 @@ const galaJS = `(() => {
   if (!box || cards.length === 0) return;
 
   const image = box.querySelector('.lightbox-image');
+  const video = box.querySelector('.lightbox-video');
   const info = box.querySelector('.lightbox-info');
   const name = box.querySelector('.lightbox-name');
   const dimensions = box.querySelector('.lightbox-dimensions');
   const download = box.querySelector('.download-link');
   const stage = box.querySelector('.lightbox-stage');
+  const closeButton = box.querySelector('.close');
+  const previousButton = box.querySelector('.prev');
+  const nextButton = box.querySelector('.next');
+  const hasMultiple = cards.length > 1;
   let index = 0;
+  let currentKind = '';
   let touchX = null;
 
+  function stopVideo() {
+    video.pause();
+    video.removeAttribute('src');
+    video.removeAttribute('poster');
+    video.load();
+    video.hidden = true;
+  }
+
+  function activeMedia() {
+    return currentKind === 'video' ? video : image;
+  }
+
+  function updateNavigation() {
+    previousButton.hidden = !hasMultiple || index === 0;
+    nextButton.hidden = !hasMultiple || index === cards.length - 1;
+  }
+
   function show(i) {
-    index = (i + cards.length) % cards.length;
+    index = Math.max(0, Math.min(cards.length - 1, i));
     const card = cards[index];
-    image.src = card.dataset.preview;
-    image.alt = card.dataset.name || '';
+    currentKind = card.dataset.kind || 'image';
+    stopVideo();
+    image.hidden = true;
+    image.removeAttribute('src');
+
+    if (currentKind === 'video') {
+      const thumb = card.querySelector('.thumb img');
+      if (thumb) video.poster = thumb.currentSrc || thumb.src;
+      video.src = card.dataset.original;
+      video.hidden = false;
+      video.load();
+    } else {
+      image.src = card.dataset.preview;
+      image.alt = card.dataset.name || '';
+      image.hidden = false;
+    }
     name.textContent = card.dataset.name || '';
     dimensions.textContent = card.dataset.dimensions || '';
     download.href = card.dataset.original;
+    updateNavigation();
+  }
+
+  function setInfoVisible(visible) {
+    info.hidden = !visible;
+    box.classList.toggle('info-open', visible);
+    if (!visible) {
+      box.style.setProperty('--info-height', '0px');
+      return;
+    }
+    requestAnimationFrame(() => {
+      box.style.setProperty('--info-height', info.offsetHeight + 'px');
+    });
   }
 
   function open(i) {
     show(i);
-    info.hidden = true;
+    setInfoVisible(false);
     box.hidden = false;
     box.setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
@@ -1291,7 +1516,11 @@ const galaJS = `(() => {
   function close() {
     box.hidden = true;
     box.setAttribute('aria-hidden', 'true');
-    image.src = '';
+    setInfoVisible(false);
+    image.removeAttribute('src');
+    image.hidden = false;
+    stopVideo();
+    currentKind = '';
     document.body.style.overflow = '';
   }
 
@@ -1300,39 +1529,76 @@ const galaJS = `(() => {
     open(i);
   }));
 
-  box.querySelector('.close').addEventListener('click', close);
-  box.querySelector('.prev').addEventListener('click', () => show(index - 1));
-  box.querySelector('.next').addEventListener('click', () => show(index + 1));
+  closeButton.addEventListener('click', close);
+  previousButton.addEventListener('click', event => {
+    event.stopPropagation();
+    if (index > 0) show(index - 1);
+  });
+  nextButton.addEventListener('click', event => {
+    event.stopPropagation();
+    if (index < cards.length - 1) show(index + 1);
+  });
 
   stage.addEventListener('click', event => {
-    const lowerZone = event.clientY > window.innerHeight * 0.72;
-    if (lowerZone) {
-      info.hidden = !info.hidden;
+    const media = activeMedia();
+    const mediaRect = media.getBoundingClientRect();
+    const closeBand = Math.max(44, Math.min(90, mediaRect.height * 0.12));
+    const topOfMedia = event.clientY >= mediaRect.top && event.clientY <= mediaRect.top + closeBand;
+    if (topOfMedia || event.clientY < 56) {
+      close();
       return;
     }
-    if (event.clientX < window.innerWidth / 2) show(index - 1);
-    else show(index + 1);
+
+    // Let the browser's native video controls receive clicks. Navigation is
+    // still available through the arrows, keyboard, and space around it.
+    if (currentKind === 'video' && event.target === video) return;
+
+    const lowerZone = event.clientY > window.innerHeight * 0.72;
+    if (lowerZone) {
+      setInfoVisible(info.hidden);
+      return;
+    }
+
+    if (event.clientX < window.innerWidth / 2) {
+      if (index > 0) show(index - 1);
+    } else if (index < cards.length - 1) {
+      show(index + 1);
+    }
   });
 
   info.addEventListener('click', event => event.stopPropagation());
   download.addEventListener('click', event => event.stopPropagation());
 
   stage.addEventListener('touchstart', event => {
+    if (currentKind === 'video' && event.target === video) {
+      touchX = null;
+      return;
+    }
     touchX = event.changedTouches[0].clientX;
   }, {passive: true});
   stage.addEventListener('touchend', event => {
     if (touchX === null) return;
     const dx = event.changedTouches[0].clientX - touchX;
     touchX = null;
-    if (Math.abs(dx) > 50) show(index + (dx < 0 ? 1 : -1));
+    if (Math.abs(dx) <= 50) return;
+    if (dx < 0 && index < cards.length - 1) show(index + 1);
+    if (dx > 0 && index > 0) show(index - 1);
   }, {passive: true});
+
+  window.addEventListener('resize', () => {
+    if (!info.hidden) box.style.setProperty('--info-height', info.offsetHeight + 'px');
+  });
 
   document.addEventListener('keydown', event => {
     if (box.hidden) return;
-    if (event.key === 'Escape') close();
-    if (event.key === 'ArrowLeft') show(index - 1);
-    if (event.key === 'ArrowRight') show(index + 1);
-    if (event.key === 'ArrowDown') info.hidden = !info.hidden;
+    if (event.key === 'Escape') {
+      close();
+      return;
+    }
+    if (currentKind === 'video' && (event.target === video || document.activeElement === video)) return;
+    if (event.key === 'ArrowLeft' && index > 0) show(index - 1);
+    if (event.key === 'ArrowRight' && index < cards.length - 1) show(index + 1);
+    if (event.key === 'ArrowDown') setInfoVisible(info.hidden);
   });
 })();
 `
