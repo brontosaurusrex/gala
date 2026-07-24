@@ -6,7 +6,7 @@ It reads an originals directory, creates a separate static website with square
 thumbnails and medium previews, and links directly back to the original files.
 The source tree is never modified.
 
-## Version 0.1.3
+## Version 0.1.4
 
 This version provides:
 
@@ -17,10 +17,12 @@ This version provides:
 - previews with a maximum dimension of 1920 pixels by default;
 - native previews for JPEG, PNG, and the first frame of GIF files;
 - MP4/MOV/M4V/WebM/MKV thumbnails through `ffmpeg`, marked by a simple play icon;
-- native browser video playback in the lightbox using the original file, so
-  Gala does not create a redundant medium-sized video still;
+- uncropped video poster frames up to 1920 pixels, shown by the native video
+  player before playback begins;
+- native browser video playback in the lightbox using the original file;
+- a virtual `Videos` folder at the project root whenever videos are present;
 - first-page PDF thumbnails through `pdftocairo`;
-- centered breadcrumb headings without a separate branded page header;
+- centered breadcrumb headings without a separate branded page header or divider line;
 - a keyboard, mouse, and touch lightbox that fits the complete preview without cropping;
 - lightbox navigation by clicking the left or right side;
 - clicking the top area of the lightbox closes it;

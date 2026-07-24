@@ -110,7 +110,7 @@ func TestScanTreeClassifiesPreviewableMedia(t *testing.T) {
 }
 
 func TestWithVersion(t *testing.T) {
-	if got := withVersion("../_gala/gala.css", "0.1.3"); got != "../_gala/gala.css?v=0.1.3" {
+	if got := withVersion("../_gala/gala.css", "0.1.4"); got != "../_gala/gala.css?v=0.1.4" {
 		t.Fatalf("unexpected versioned URL %q", got)
 	}
 	if got := withVersion("image.jpg?x=1", "two words"); got != "image.jpg?x=1&v=two+words" {
@@ -140,10 +140,12 @@ func TestLightboxDoesNotWrap(t *testing.T) {
 	}
 }
 
-func TestVideoUsesOriginalInNativePlayer(t *testing.T) {
+func TestVideoUsesOriginalWithGeneratedPoster(t *testing.T) {
 	checks := []string{
 		`<video class="lightbox-video" controls preload="metadata" hidden></video>`,
 		`data-kind="{{.Kind}}"`,
+		`data-poster="{{.PosterURL}}"`,
+		`video.poster = card.dataset.poster || ''`,
 		`video.src = card.dataset.original`,
 		`if (currentKind === 'video' && event.target === video) return`,
 		`document.activeElement === video`,
@@ -155,18 +157,20 @@ func TestVideoUsesOriginalInNativePlayer(t *testing.T) {
 	}
 }
 
-func TestVideoCacheRequiresOnlyThumbnail(t *testing.T) {
+func TestVideoCacheRequiresThumbnailAndPoster(t *testing.T) {
 	dir := t.TempDir()
-	thumb := filepath.Join(dir, "thumb.jpg")
-	if err := os.WriteFile(thumb, []byte("thumbnail"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"thumb.jpg", "poster.jpg"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	entry := ManifestImage{Thumb: "thumb.jpg", Preview: ""}
-	if !manifestAssetsExist(dir, "video", entry) {
-		t.Fatal("video entry should be complete with a thumbnail and no medium preview")
+	complete := ManifestImage{Thumb: "thumb.jpg", Preview: "poster.jpg"}
+	if !manifestAssetsExist(dir, "video", complete) {
+		t.Fatal("video entry should require both thumbnail and poster")
 	}
-	if manifestAssetsExist(dir, "image", entry) {
-		t.Fatal("still image entry should require a medium preview")
+	missingPoster := ManifestImage{Thumb: "thumb.jpg"}
+	if manifestAssetsExist(dir, "video", missingPoster) {
+		t.Fatal("video entry without a poster should be regenerated")
 	}
 }
 
@@ -200,6 +204,66 @@ func TestFolderAndVideoCardsUseIconsWithoutSpecialBorders(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(galaCSS, check) {
 			t.Fatalf("icon-only folder/video styling missing %q", check)
+		}
+	}
+}
+
+func TestHeaderHasNoDivider(t *testing.T) {
+	if strings.Contains(galaCSS, ".site-header") && strings.Contains(galaCSS, "border-bottom: 1px solid #ffffff12") {
+		t.Fatal("breadcrumb header still has a bottom divider")
+	}
+}
+
+func TestVirtualVideosCollection(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "originals")
+	output := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(filepath.Join(source, "clips"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	videoPath := filepath.Join(source, "clips", "sample.mp4")
+	if err := os.WriteFile(videoPath, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, files, err := scanTree(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := ManifestImage{
+		Size: 5, ModNano: 1,
+		Thumb:   "_gala/thumbs/video.jpg",
+		Preview: "_gala/previews/video.jpg",
+		Width:   1920, Height: 1080,
+	}
+	images := map[string]ManifestImage{"clips/sample.mp4": entry}
+	pages, err := writePages(source, output, Options{ThumbSize: 320, PreviewSize: 1920}, dirs, files, images, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pages) != 3 {
+		t.Fatalf("generated %d pages, want root, clips, and Videos collection", len(pages))
+	}
+
+	rootHTML, err := os.ReadFile(filepath.Join(output, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rootHTML), `href="_gala/collections/videos/index.html"`) {
+		t.Fatal("root page does not link to the virtual Videos collection")
+	}
+
+	collectionHTML, err := os.ReadFile(filepath.Join(output, "_gala", "collections", "videos", "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := string(collectionHTML)
+	for _, check := range []string{
+		`clips/sample.mp4`,
+		`data-kind="video"`,
+		`data-poster=`,
+	} {
+		if !strings.Contains(collection, check) {
+			t.Fatalf("Videos collection missing %q", check)
 		}
 	}
 }

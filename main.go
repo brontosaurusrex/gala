@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-const version = "0.1.3"
+const version = "0.1.4"
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -118,6 +118,7 @@ type ImageCard struct {
 	Name        string
 	ThumbURL    string
 	PreviewURL  string
+	PosterURL   string
 	OriginalURL string
 	Width       int
 	Height      int
@@ -318,15 +319,10 @@ func run(opts Options) error {
 	for _, f := range previewFiles {
 		old, ok := oldManifest.Images[f.Rel]
 		cacheCompatible := oldManifest.ThumbSize == opts.ThumbSize &&
-			(f.Kind == "video" || oldManifest.PreviewSize == opts.PreviewSize)
+			oldManifest.PreviewSize == opts.PreviewSize
 		unchanged := cacheCompatible && ok && old.Size == f.Size && old.ModNano == f.ModNano &&
 			manifestAssetsExist(output, f.Kind, old)
 		if unchanged && !opts.Force {
-			// Gala 0.1.2 generated a medium still for videos. Videos now use only
-			// the thumbnail; the original file is played directly in the lightbox.
-			if f.Kind == "video" {
-				old.Preview = ""
-			}
 			newImages[f.Rel] = old
 		} else {
 			jobs = append(jobs, imageJob{File: f, Old: old})
@@ -377,7 +373,7 @@ func run(opts Options) error {
 	cleanupStale(output, oldManifest, newImages, pages)
 
 	manifest := Manifest{
-		Version:     4,
+		Version:     5,
 		Source:      source,
 		ThumbSize:   opts.ThumbSize,
 		PreviewSize: opts.PreviewSize,
@@ -583,13 +579,6 @@ func generateImageAssets(f ScanFile, output string, opts Options) (ManifestImage
 
 	if err := writeJPEGAtomic(thumbAbs, thumb, 84); err != nil {
 		return ManifestImage{}, err
-	}
-
-	if f.Kind == "video" {
-		return ManifestImage{
-			Size: f.Size, ModNano: f.ModNano, Thumb: thumbRel,
-			Width: width, Height: height, SourceType: format,
-		}, nil
 	}
 
 	previewAbs := filepath.Join(output, filepath.FromSlash(previewRel))
@@ -865,14 +854,29 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 	if err != nil {
 		return nil, err
 	}
+
 	dirKeys := make([]string, 0, len(dirs))
 	for rel := range dirs {
 		dirKeys = append(dirKeys, rel)
 	}
-	sort.Slice(dirKeys, func(i, j int) bool { return strings.ToLower(dirKeys[i]) < strings.ToLower(dirKeys[j]) })
+	sort.Slice(dirKeys, func(i, j int) bool {
+		return strings.ToLower(dirKeys[i]) < strings.ToLower(dirKeys[j])
+	})
 
-	pages := make([]string, 0, len(dirKeys))
+	videos := make([]ScanFile, 0)
+	for _, f := range files {
+		if f.Kind == "video" {
+			videos = append(videos, f)
+		}
+	}
+
+	pages := make([]string, 0, len(dirKeys)+1)
 	sourceName := filepath.Base(source)
+	generatedAt := time.Now().Format("2006-01-02 15:04")
+	rootIndex := filepath.Join(output, "index.html")
+	videoCollectionDir := filepath.Join(output, "_gala", "collections", "videos")
+	videoCollectionIndex := filepath.Join(videoCollectionDir, "index.html")
+
 	for _, rel := range dirKeys {
 		d := dirs[rel]
 		pageDir := filepath.Join(output, filepath.FromSlash(rel))
@@ -885,7 +889,7 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 			Title: sourceName, SourceName: sourceName,
 			CSSURL:      withVersion(webRel(pageDir, filepath.Join(output, "_gala", "gala.css")), version),
 			JSURL:       withVersion(webRel(pageDir, filepath.Join(output, "_gala", "gala.js")), version),
-			GeneratedAt: time.Now().Format("2006-01-02 15:04"),
+			GeneratedAt: generatedAt,
 		}
 		if rel != "" {
 			data.Title = filepath.Base(filepath.FromSlash(rel))
@@ -908,38 +912,28 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 			data.Folders = append(data.Folders, fc)
 		}
 
-		for _, f := range d.Files {
-			original := originalLink(opts, source, output, pageDir, f.Rel)
-			if f.IsPreviewable {
-				if entry, ok := images[f.Rel]; ok {
-					badge := ""
-					if f.Kind == "video" {
-						badge = "▶"
-					} else if f.Kind == "pdf" {
-						badge = "PDF"
-					}
-					token := cacheToken(entry, opts)
-					previewURL := original
-					if f.Kind != "video" {
-						previewURL = withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token)
-					}
-					data.Images = append(data.Images, ImageCard{
-						Name: f.Name, OriginalURL: original,
-						ThumbURL:   withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), token),
-						PreviewURL: previewURL,
-						Width:      entry.Width, Height: entry.Height,
-						Kind: f.Kind, Badge: badge,
-					})
-					continue
+		if rel == "" && len(videos) > 0 {
+			collection := FolderCard{
+				Name:  "Videos",
+				Href:  webRel(pageDir, videoCollectionIndex),
+				Count: len(videos),
+			}
+			for _, videoFile := range videos {
+				if entry, ok := images[videoFile.Rel]; ok {
+					collection.HasThumb = true
+					collection.ThumbURL = withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), cacheToken(entry, opts))
+					break
 				}
 			}
-			ext := strings.TrimPrefix(strings.ToUpper(f.Ext), ".")
-			if ext == "" {
-				ext = "FILE"
+			data.Folders = append([]FolderCard{collection}, data.Folders...)
+		}
+
+		for _, f := range d.Files {
+			if entry, ok := images[f.Rel]; ok && f.IsPreviewable {
+				data.Images = append(data.Images, makeImageCard(source, output, pageDir, opts, f, entry, f.Name))
+				continue
 			}
-			data.Files = append(data.Files, FileCard{
-				Name: f.Name, OriginalURL: original, Extension: ext, Size: humanSize(f.Size),
-			})
+			data.Files = append(data.Files, makeFileCard(source, output, pageDir, opts, f, f.Name))
 		}
 		data.Empty = len(data.Folders) == 0 && len(data.Images) == 0 && len(data.Files) == 0
 
@@ -949,7 +943,77 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 		pageRel, _ := filepath.Rel(output, pagePath)
 		pages = append(pages, filepath.ToSlash(pageRel))
 	}
+
+	if len(videos) > 0 {
+		if err := os.MkdirAll(videoCollectionDir, 0o755); err != nil {
+			return nil, err
+		}
+		data := PageData{
+			Title:       "Videos",
+			SourceName:  sourceName,
+			CSSURL:      withVersion(webRel(videoCollectionDir, filepath.Join(output, "_gala", "gala.css")), version),
+			JSURL:       withVersion(webRel(videoCollectionDir, filepath.Join(output, "_gala", "gala.js")), version),
+			GeneratedAt: generatedAt,
+			Breadcrumbs: []Link{
+				{Label: sourceName, Href: webRel(videoCollectionDir, rootIndex)},
+				{Label: "Videos"},
+			},
+		}
+		for _, f := range videos {
+			if entry, ok := images[f.Rel]; ok {
+				data.Images = append(data.Images, makeImageCard(source, output, videoCollectionDir, opts, f, entry, f.Rel))
+			} else {
+				data.Files = append(data.Files, makeFileCard(source, output, videoCollectionDir, opts, f, f.Rel))
+			}
+		}
+		data.Empty = len(data.Images) == 0 && len(data.Files) == 0
+		if err := writeTemplateAtomic(videoCollectionIndex, tmpl, data); err != nil {
+			return nil, err
+		}
+		pageRel, _ := filepath.Rel(output, videoCollectionIndex)
+		pages = append(pages, filepath.ToSlash(pageRel))
+	}
+
 	return pages, nil
+}
+
+func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, entry ManifestImage, displayName string) ImageCard {
+	original := originalLink(opts, source, output, pageDir, f.Rel)
+	token := cacheToken(entry, opts)
+	thumbURL := withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), token)
+	mediumURL := withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token)
+
+	previewURL := mediumURL
+	posterURL := ""
+	badge := ""
+	switch f.Kind {
+	case "video":
+		badge = "▶"
+		previewURL = original
+		posterURL = mediumURL
+	case "pdf":
+		badge = "PDF"
+	}
+
+	return ImageCard{
+		Name: displayName, OriginalURL: original,
+		ThumbURL: thumbURL, PreviewURL: previewURL, PosterURL: posterURL,
+		Width: entry.Width, Height: entry.Height,
+		Kind: f.Kind, Badge: badge,
+	}
+}
+
+func makeFileCard(source, output, pageDir string, opts Options, f ScanFile, displayName string) FileCard {
+	ext := strings.TrimPrefix(strings.ToUpper(f.Ext), ".")
+	if ext == "" {
+		ext = "FILE"
+	}
+	return FileCard{
+		Name:        displayName,
+		OriginalURL: originalLink(opts, source, output, pageDir, f.Rel),
+		Extension:   ext,
+		Size:        humanSize(f.Size),
+	}
 }
 
 func makeBreadcrumbs(output, pageDir, rel, sourceName string) []Link {
@@ -1136,9 +1200,6 @@ func manifestAssetsExist(output, kind string, entry ManifestImage) bool {
 	if entry.Thumb == "" || !fileExists(filepath.Join(output, filepath.FromSlash(entry.Thumb))) {
 		return false
 	}
-	if kind == "video" {
-		return true
-	}
 	return entry.Preview != "" && fileExists(filepath.Join(output, filepath.FromSlash(entry.Preview)))
 }
 
@@ -1310,7 +1371,7 @@ const pageTemplate = `<!doctype html>
     <h2 id="media-heading">Media</h2>
     <div class="grid image-grid">
       {{range .Images}}
-      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-preview="{{.PreviewURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}">
+      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}">
         <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>
       </a>
@@ -1371,7 +1432,7 @@ const galaCSS = `:root {
 html { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
 body { margin: 0; min-height: 100vh; }
 a { color: inherit; text-decoration: none; }
-.site-header { position: sticky; top: 0; z-index: 10; padding: 1rem clamp(1rem, 4vw, 3rem); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid #ffffff12; }
+.site-header { position: sticky; top: 0; z-index: 10; padding: 1rem clamp(1rem, 4vw, 3rem); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); }
 .breadcrumbs { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; color: var(--muted); font-size: clamp(1.05rem, 2.2vw, 1.45rem); font-weight: 650; line-height: 1.25; }
 .breadcrumbs a:hover { color: var(--text); }
 .breadcrumbs [aria-current="page"] { color: var(--text); }
@@ -1477,8 +1538,7 @@ const galaJS = `(() => {
     image.removeAttribute('src');
 
     if (currentKind === 'video') {
-      const thumb = card.querySelector('.thumb img');
-      if (thumb) video.poster = thumb.currentSrc || thumb.src;
+      video.poster = card.dataset.poster || '';
       video.src = card.dataset.original;
       video.hidden = false;
       video.load();
