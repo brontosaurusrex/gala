@@ -8,6 +8,8 @@ The source tree is never modified.
 
 ![slopware warning](https://brontosaurusrex.github.io/media/slopware02.svg)
 
+Warning: This software is ai generated (vibe coded) and since it reads / writes data on your disk, it could be potentialy dangerous.
+
 ## Version 0.1.4
 
 This version provides:
