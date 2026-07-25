@@ -1,6 +1,7 @@
 # Gala
 
 **Gala** is an incremental static gallery generator for directory trees.
+Masivelly parallel static html gallery generator
 
 It reads an originals directory, creates a separate static website with square
 thumbnails and medium previews, and links directly back to the original files.

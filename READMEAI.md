@@ -8,7 +8,7 @@ The source tree is never modified.
 
 This file is named `READMEAI.md` so you can keep your own `README.md` beside it.
 
-## Version 0.1.8
+## Version 0.1.9
 
 This version provides:
 
@@ -30,7 +30,7 @@ This version provides:
 - hover hints for the lightbox exit and download areas;
 - deep links for individual lightbox items using `#media=...`, plus a Copy link button;
 - selected EXIF details shown in the lightbox when ExifTool metadata is available;
-- generated preview URLs include the original base filename as an `imagename=...` query parameter;
+- generated preview URLs include the original base filename as an `filename=...` query parameter;
 - missing EXIF fields remain empty instead of rendering as `<nil>`;
 - previous/next controls that disappear at the ends, with no wrap-around;
 - a footer credit that stays hidden until the footer is hovered;

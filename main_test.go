@@ -395,7 +395,7 @@ func TestDeepLinkingAndCopyLinkSupport(t *testing.T) {
 		`location.pathname + location.search`,
 		`window.addEventListener('hashchange', openFromLocation)`,
 		`navigator.clipboard.writeText(currentShareURL())`,
-		`hash = 'media=' + encodeURIComponent(currentMediaID())`,
+		`hash = 'media=' + encodeURIComponent(currentMediaID()) + '&filename=' + encodeURIComponent(cards[index].dataset.filename || '')`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(pageTemplate+galaJS, check) {
@@ -472,7 +472,7 @@ func TestWritePagesIncludesExifData(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := string(html)
-	for _, check := range []string{`data-exif=`, `Canon EOS R6`, `data-media-id=`} {
+	for _, check := range []string{`data-exif=`, `Canon EOS R6`, `data-media-id=`, `data-filename=`} {
 		if !strings.Contains(page, check) {
 			t.Fatalf("page missing %q", check)
 		}
@@ -480,11 +480,11 @@ func TestWritePagesIncludesExifData(t *testing.T) {
 }
 
 func TestWithImageName(t *testing.T) {
-	if got := withImageName("preview.jpg?v=abc", "dir/one photo.jpg"); got != "preview.jpg?v=abc&imagename=one+photo.jpg" {
-		t.Fatalf("unexpected imagename URL %q", got)
+	if got := withFileName("preview.jpg?v=abc", "dir/one photo.jpg"); got != "preview.jpg?v=abc&filename=one+photo.jpg" {
+		t.Fatalf("unexpected filename URL %q", got)
 	}
-	if got := withImageName("preview.jpg", "one.jpg"); got != "preview.jpg?imagename=one.jpg" {
-		t.Fatalf("unexpected imagename URL without prior query %q", got)
+	if got := withFileName("preview.jpg", "one.jpg"); got != "preview.jpg?filename=one.jpg" {
+		t.Fatalf("unexpected filename URL without prior query %q", got)
 	}
 }
 
@@ -511,7 +511,7 @@ func TestPreviewURLsIncludeImageName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(html), "imagename=one.jpg") {
+	if !strings.Contains(string(html), "filename=one.jpg") {
 		t.Fatalf("preview URL does not contain image name: %s", string(html))
 	}
 }

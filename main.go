@@ -33,7 +33,7 @@ import (
 	"time"
 )
 
-const version = "0.1.8"
+const version = "0.1.9"
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -150,6 +150,7 @@ type ExifInfo struct {
 
 type ImageCard struct {
 	Name        string
+	FileName    string
 	MediaID     string
 	ThumbURL    string
 	PreviewURL  string
@@ -1334,7 +1335,7 @@ func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, ent
 	original := originalLink(opts, source, output, pageDir, f.Rel)
 	token := cacheToken(entry, opts)
 	thumbURL := withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), token)
-	mediumURL := withImageName(
+	mediumURL := withFileName(
 		withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token),
 		f.Name,
 	)
@@ -1354,7 +1355,7 @@ func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, ent
 	}
 
 	return ImageCard{
-		Name: displayName, MediaID: shortHash(f.Rel), OriginalURL: original,
+		Name: displayName, FileName: filepath.Base(f.Name), MediaID: shortHash(f.Rel), OriginalURL: original,
 		ThumbURL: thumbURL, PreviewURL: previewURL, PosterURL: posterURL,
 		ExifJSON: encodeExifData(entry.Exif),
 		Width:    entry.Width, Height: entry.Height,
@@ -1421,7 +1422,7 @@ func withVersion(rawURL, token string) string {
 	return rawURL + separator + "v=" + url.QueryEscape(token)
 }
 
-func withImageName(rawURL, name string) string {
+func withFileName(rawURL, name string) string {
 	if name == "" {
 		return rawURL
 	}
@@ -1429,7 +1430,7 @@ func withImageName(rawURL, name string) string {
 	if strings.Contains(rawURL, "?") {
 		separator = "&"
 	}
-	return rawURL + separator + "imagename=" + url.QueryEscape(filepath.Base(name))
+	return rawURL + separator + "filename=" + url.QueryEscape(filepath.Base(name))
 }
 
 func cacheToken(entry ManifestImage, opts Options) string {
@@ -1749,7 +1750,7 @@ const pageTemplate = `<!doctype html>
     <h2 id="media-heading">Media</h2>
     <div class="grid image-grid">
       {{range .Images}}
-      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-media-id="{{.MediaID}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}" data-exif='{{.ExifJSON}}'>
+      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-media-id="{{.MediaID}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-filename="{{.FileName}}" data-dimensions="{{.Width}} × {{.Height}}" data-exif='{{.ExifJSON}}'>
         <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>
       </a>
@@ -1941,7 +1942,7 @@ const galaJS = `(() => {
 
   function currentShareURL() {
     const url = new URL(window.location.href);
-    url.hash = 'media=' + encodeURIComponent(currentMediaID());
+    url.hash = 'media=' + encodeURIComponent(currentMediaID()) + '&filename=' + encodeURIComponent(cards[index].dataset.filename || '');
     return url.toString();
   }
 
