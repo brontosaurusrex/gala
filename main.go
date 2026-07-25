@@ -33,7 +33,7 @@ import (
 	"time"
 )
 
-const version = "0.1.5"
+const version = "0.1.8"
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -87,13 +87,15 @@ type Manifest struct {
 }
 
 type ManifestImage struct {
-	Size       int64  `json:"size"`
-	ModNano    int64  `json:"mtime_ns"`
-	Thumb      string `json:"thumb"`
-	Preview    string `json:"preview"`
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	SourceType string `json:"source_type"`
+	Size       int64     `json:"size"`
+	ModNano    int64     `json:"mtime_ns"`
+	Thumb      string    `json:"thumb"`
+	Preview    string    `json:"preview"`
+	Width      int       `json:"width"`
+	Height     int       `json:"height"`
+	SourceType string    `json:"source_type"`
+	ExifReady  bool      `json:"exif_ready"`
+	Exif       *ExifInfo `json:"exif,omitempty"`
 }
 
 type imageJob struct {
@@ -135,12 +137,25 @@ type Dependencies struct {
 	Magick     string
 }
 
+type ExifInfo struct {
+	Camera               string `json:"camera,omitempty"`
+	Lens                 string `json:"lens,omitempty"`
+	CaptureTime          string `json:"captureTime,omitempty"`
+	ExposureTime         string `json:"exposureTime,omitempty"`
+	Aperture             string `json:"aperture,omitempty"`
+	ISO                  string `json:"iso,omitempty"`
+	FocalLength          string `json:"focalLength,omitempty"`
+	ExposureCompensation string `json:"exposureCompensation,omitempty"`
+}
+
 type ImageCard struct {
 	Name        string
+	MediaID     string
 	ThumbURL    string
 	PreviewURL  string
 	PosterURL   string
 	OriginalURL string
+	ExifJSON    string
 	Width       int
 	Height      int
 	Kind        string
@@ -358,8 +373,9 @@ func runContext(ctx context.Context, opts Options) error {
 		old, ok := oldManifest.Images[f.Rel]
 		cacheCompatible := oldManifest.ThumbSize == opts.ThumbSize &&
 			oldManifest.PreviewSize == opts.PreviewSize
+		wantsExif := deps.ExifTool != "" && (f.Kind == "image" || f.Kind == "raw")
 		unchanged := cacheCompatible && ok && old.Size == f.Size && old.ModNano == f.ModNano &&
-			manifestAssetsExist(output, f.Kind, old)
+			manifestAssetsExist(output, f.Kind, old) && (!wantsExif || old.ExifReady)
 		if unchanged && !opts.Force {
 			newImages[f.Rel] = old
 		} else if !deps.canPreview(f.Kind) {
@@ -423,7 +439,7 @@ func runContext(ctx context.Context, opts Options) error {
 	cleanupStale(output, oldManifest, newImages, pages)
 
 	manifest := Manifest{
-		Version:     6,
+		Version:     7,
 		Source:      source,
 		ThumbSize:   opts.ThumbSize,
 		PreviewSize: opts.PreviewSize,
@@ -745,9 +761,16 @@ func generateImageAssets(ctx context.Context, f ScanFile, output string, opts Op
 		return ManifestImage{}, err
 	}
 
+	var exif *ExifInfo
+	exifReady := false
+	if deps.ExifTool != "" && (f.Kind == "image" || f.Kind == "raw") {
+		exif, exifReady = extractExifInfo(ctx, f.Abs, deps)
+	}
+
 	return ManifestImage{
 		Size: f.Size, ModNano: f.ModNano, Thumb: thumbRel, Preview: previewRel,
 		Width: width, Height: height, SourceType: format,
+		ExifReady: exifReady, Exif: exif,
 	}, nil
 }
 
@@ -884,6 +907,108 @@ func decodeRAWPreview(ctx context.Context, f ScanFile, previewSize int, deps Dep
 		return nil, "", errors.New("no RAW preview helper is installed")
 	}
 	return nil, "", fmt.Errorf("RAW preview failed: %s", strings.Join(attempts, "; "))
+}
+
+func extractExifInfo(ctx context.Context, path string, deps Dependencies) (*ExifInfo, bool) {
+	if deps.ExifTool == "" {
+		return nil, false
+	}
+	output, err := runExternalOutput(ctx, 20*time.Second, deps.ExifTool,
+		"-json",
+		"-Make", "-Model", "-LensModel", "-DateTimeOriginal",
+		"-ExposureTime", "-FNumber", "-ISO", "-FocalLength", "-ExposureCompensation",
+		path,
+	)
+	if err != nil {
+		return nil, true
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(output, &rows); err != nil || len(rows) == 0 {
+		return nil, true
+	}
+	info := normalizeExifInfo(rows[0])
+	return info, true
+}
+
+func normalizeExifInfo(row map[string]any) *ExifInfo {
+	makeValue := exifString(row["Make"])
+	modelValue := exifString(row["Model"])
+	camera := strings.TrimSpace(modelValue)
+	if camera == "" {
+		camera = strings.TrimSpace(makeValue)
+	} else if makeValue != "" && !strings.HasPrefix(strings.ToLower(camera), strings.ToLower(strings.TrimSpace(makeValue))) {
+		camera = strings.TrimSpace(makeValue + " " + camera)
+	}
+	lens := exifString(row["LensModel"])
+	captureTime := formatExifDate(exifString(row["DateTimeOriginal"]))
+	exposureTime := exifString(row["ExposureTime"])
+	if exposureTime != "" && !strings.Contains(strings.ToLower(exposureTime), "s") {
+		exposureTime += " s"
+	}
+	aperture := exifString(row["FNumber"])
+	if aperture != "" && !strings.HasPrefix(strings.ToLower(aperture), "f/") {
+		aperture = "f/" + aperture
+	}
+	iso := exifString(row["ISO"])
+	focalLength := exifString(row["FocalLength"])
+	if focalLength != "" && !strings.Contains(strings.ToLower(focalLength), "mm") {
+		focalLength += " mm"
+	}
+	exposureComp := exifString(row["ExposureCompensation"])
+	if exposureComp != "" && !strings.Contains(strings.ToUpper(exposureComp), "EV") {
+		exposureComp += " EV"
+	}
+	info := &ExifInfo{
+		Camera:               camera,
+		Lens:                 lens,
+		CaptureTime:          captureTime,
+		ExposureTime:         exposureTime,
+		Aperture:             aperture,
+		ISO:                  iso,
+		FocalLength:          focalLength,
+		ExposureCompensation: exposureComp,
+	}
+	if info.Camera == "" && info.Lens == "" && info.CaptureTime == "" && info.ExposureTime == "" && info.Aperture == "" && info.ISO == "" && info.FocalLength == "" && info.ExposureCompensation == "" {
+		return nil
+	}
+	return info
+}
+
+func exifString(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case float64:
+		if x == float64(int64(x)) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case json.Number:
+		return x.String()
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func formatExifDate(s string) string {
+	if len(s) >= 19 && s[4] == ':' && s[7] == ':' {
+		return s[:4] + "-" + s[5:7] + "-" + s[8:]
+	}
+	return s
+}
+
+func encodeExifData(exif *ExifInfo) string {
+	if exif == nil {
+		return ""
+	}
+	b, err := json.Marshal(exif)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func runExternal(ctx context.Context, timeout time.Duration, name string, args ...string) error {
@@ -1209,7 +1334,10 @@ func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, ent
 	original := originalLink(opts, source, output, pageDir, f.Rel)
 	token := cacheToken(entry, opts)
 	thumbURL := withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Thumb))), token)
-	mediumURL := withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token)
+	mediumURL := withImageName(
+		withVersion(webRel(pageDir, filepath.Join(output, filepath.FromSlash(entry.Preview))), token),
+		f.Name,
+	)
 
 	previewURL := mediumURL
 	posterURL := ""
@@ -1226,9 +1354,10 @@ func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, ent
 	}
 
 	return ImageCard{
-		Name: displayName, OriginalURL: original,
+		Name: displayName, MediaID: shortHash(f.Rel), OriginalURL: original,
 		ThumbURL: thumbURL, PreviewURL: previewURL, PosterURL: posterURL,
-		Width: entry.Width, Height: entry.Height,
+		ExifJSON: encodeExifData(entry.Exif),
+		Width:    entry.Width, Height: entry.Height,
 		Kind: f.Kind, Badge: badge,
 	}
 }
@@ -1290,6 +1419,17 @@ func withVersion(rawURL, token string) string {
 		separator = "&"
 	}
 	return rawURL + separator + "v=" + url.QueryEscape(token)
+}
+
+func withImageName(rawURL, name string) string {
+	if name == "" {
+		return rawURL
+	}
+	separator := "?"
+	if strings.Contains(rawURL, "?") {
+		separator = "&"
+	}
+	return rawURL + separator + "imagename=" + url.QueryEscape(filepath.Base(name))
 }
 
 func cacheToken(entry ManifestImage, opts Options) string {
@@ -1609,7 +1749,7 @@ const pageTemplate = `<!doctype html>
     <h2 id="media-heading">Media</h2>
     <div class="grid image-grid">
       {{range .Images}}
-      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}">
+      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-media-id="{{.MediaID}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-dimensions="{{.Width}} × {{.Height}}" data-exif='{{.ExifJSON}}'>
         <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>
       </a>
@@ -1649,8 +1789,14 @@ const pageTemplate = `<!doctype html>
   </div>
   <button class="nav next" type="button" aria-label="Next" {{if lt (len .Images) 2}}hidden{{end}}>›</button>
   <div class="lightbox-info" hidden>
-    <div><strong class="lightbox-name"></strong><span class="lightbox-dimensions"></span></div>
-    <a class="download-link" href="" download>Download original</a>
+    <div class="lightbox-details">
+      <div><strong class="lightbox-name"></strong><span class="lightbox-dimensions"></span></div>
+      <div class="lightbox-exif" hidden></div>
+    </div>
+    <div class="lightbox-actions">
+      <button class="copy-link" type="button">Copy link</button>
+      <a class="download-link" href="" download>Download original</a>
+    </div>
   </div>
 </div>
 </body>
@@ -1727,12 +1873,19 @@ footer:hover span { opacity: 1; }
 .nav[hidden] { display: none; }
 .prev { left: .7rem; }
 .next { right: .7rem; }
-.lightbox-info { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem clamp(1rem, 4vw, 3rem); background: #10131aeb; border-top: 1px solid #ffffff20; }
+.lightbox-info { position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 1rem clamp(1rem, 4vw, 3rem); background: #10131aeb; border-top: 1px solid #ffffff20; }
 .lightbox-info[hidden] { display: none; }
-.lightbox-info div { display: grid; gap: .2rem; min-width: 0; }
+.lightbox-details { display: grid; gap: .45rem; min-width: 0; }
+.lightbox-details > div:first-child { display: grid; gap: .2rem; }
+.lightbox-exif { display: grid; gap: .22rem; color: var(--muted); font-size: .8rem; }
+.lightbox-exif[hidden] { display: none; }
+.lightbox-exif strong { color: var(--text); }
 .lightbox-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lightbox-dimensions { color: var(--muted); font-size: .8rem; }
-.download-link { flex: none; padding: .7rem 1rem; border-radius: 8px; background: var(--accent); color: #17120a; font-weight: 750; }
+.lightbox-actions { display: flex; align-items: center; gap: .75rem; flex: none; }
+.copy-link, .download-link { flex: none; padding: .7rem 1rem; border-radius: 8px; font-weight: 750; }
+.copy-link { border: 1px solid #ffffff25; background: #ffffff10; color: var(--text); cursor: pointer; }
+.download-link { background: var(--accent); color: #17120a; }
 @media (max-width: 640px) {
   .grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .lightbox-stage { padding: 3.75rem .5rem .5rem; }
@@ -1755,13 +1908,16 @@ const galaJS = `(() => {
   const info = box.querySelector('.lightbox-info');
   const name = box.querySelector('.lightbox-name');
   const dimensions = box.querySelector('.lightbox-dimensions');
+  const exif = box.querySelector('.lightbox-exif');
   const download = box.querySelector('.download-link');
+  const copyLink = box.querySelector('.copy-link');
   const stage = box.querySelector('.lightbox-stage');
   const closeButton = box.querySelector('.close');
   const previousButton = box.querySelector('.prev');
   const nextButton = box.querySelector('.next');
   const exitHint = box.querySelector('.exit-hint');
   const downloadHint = box.querySelector('.download-hint');
+  const byMediaId = new Map(cards.map((card, i) => [card.dataset.mediaId || String(i), i]));
   const hasMultiple = cards.length > 1;
   let index = 0;
   let currentKind = '';
@@ -1779,6 +1935,24 @@ const galaJS = `(() => {
     return currentKind === 'video' ? video : image;
   }
 
+  function currentMediaID() {
+    return cards[index].dataset.mediaId || String(index);
+  }
+
+  function currentShareURL() {
+    const url = new URL(window.location.href);
+    url.hash = 'media=' + encodeURIComponent(currentMediaID());
+    return url.toString();
+  }
+
+  function syncURL() {
+    history.replaceState(null, '', currentShareURL());
+  }
+
+  function clearURL() {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
   function updateNavigation() {
     previousButton.hidden = !hasMultiple || index === 0;
     nextButton.hidden = !hasMultiple || index === cards.length - 1;
@@ -1787,6 +1961,49 @@ const galaJS = `(() => {
   function hideHints() {
     exitHint.classList.remove('visible');
     downloadHint.classList.remove('visible');
+  }
+
+  function escapeHTML(value) {
+    return String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;');
+  }
+
+  function renderExif(card) {
+    const raw = card.dataset.exif || '';
+    if (!raw) {
+      exif.hidden = true;
+      exif.innerHTML = '';
+      return;
+    }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      exif.hidden = true;
+      exif.innerHTML = '';
+      return;
+    }
+    const lines = [];
+    if (data.camera) lines.push('<div><strong>' + escapeHTML(data.camera) + '</strong></div>');
+    if (data.lens) lines.push('<div>' + escapeHTML(data.lens) + '</div>');
+    const exposure = [];
+    if (data.exposureTime) exposure.push(escapeHTML(data.exposureTime));
+    if (data.aperture) exposure.push(escapeHTML(data.aperture));
+    if (data.iso) exposure.push('ISO ' + escapeHTML(data.iso));
+    if (data.focalLength) exposure.push(escapeHTML(data.focalLength));
+    if (data.exposureCompensation) exposure.push(escapeHTML(data.exposureCompensation));
+    if (exposure.length) lines.push('<div>' + exposure.join(' · ') + '</div>');
+    if (data.captureTime) lines.push('<div>' + escapeHTML(data.captureTime) + '</div>');
+    if (!lines.length) {
+      exif.hidden = true;
+      exif.innerHTML = '';
+      return;
+    }
+    exif.hidden = false;
+    exif.innerHTML = lines.join('');
   }
 
   function show(i) {
@@ -1810,8 +2027,10 @@ const galaJS = `(() => {
     name.textContent = card.dataset.name || '';
     dimensions.textContent = card.dataset.dimensions || '';
     download.href = card.dataset.original;
+    renderExif(card);
     hideHints();
     updateNavigation();
+    if (!box.hidden) syncURL();
   }
 
   function setInfoVisible(visible) {
@@ -1828,11 +2047,11 @@ const galaJS = `(() => {
   }
 
   function open(i) {
-    show(i);
-    setInfoVisible(false);
     box.hidden = false;
     box.setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
+    setInfoVisible(false);
+    show(i);
   }
 
   function close() {
@@ -1845,6 +2064,21 @@ const galaJS = `(() => {
     currentKind = '';
     hideHints();
     document.body.style.overflow = '';
+    clearURL();
+  }
+
+  function openFromLocation() {
+    const hash = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+    const params = new URLSearchParams(hash);
+    const id = params.get('media');
+    if (!id) {
+      if (!box.hidden) close();
+      return;
+    }
+    const found = byMediaId.get(id);
+    if (found === undefined) return;
+    if (box.hidden) open(found);
+    else show(found);
   }
 
   cards.forEach((card, i) => card.addEventListener('click', event => {
@@ -1860,6 +2094,19 @@ const galaJS = `(() => {
   nextButton.addEventListener('click', event => {
     event.stopPropagation();
     if (index < cards.length - 1) show(index + 1);
+  });
+  copyLink.addEventListener('click', async event => {
+    event.stopPropagation();
+    const oldLabel = copyLink.textContent;
+    try {
+      await navigator.clipboard.writeText(currentShareURL());
+      copyLink.textContent = 'Copied';
+    } catch {
+      copyLink.textContent = 'Copy failed';
+    }
+    window.setTimeout(() => {
+      copyLink.textContent = oldLabel;
+    }, 1200);
   });
 
   stage.addEventListener('mousemove', event => {
@@ -1884,8 +2131,6 @@ const galaJS = `(() => {
       return;
     }
 
-    // Let the browser's native video controls receive clicks. Navigation is
-    // still available through the arrows, keyboard, and space around it.
     if (currentKind === 'video' && event.target === video) return;
 
     const lowerZone = event.clientY > window.innerHeight * 0.72;
@@ -1923,6 +2168,7 @@ const galaJS = `(() => {
   window.addEventListener('resize', () => {
     if (!info.hidden) box.style.setProperty('--info-height', info.offsetHeight + 'px');
   });
+  window.addEventListener('hashchange', openFromLocation);
 
   document.addEventListener('keydown', event => {
     if (box.hidden) return;
@@ -1935,5 +2181,6 @@ const galaJS = `(() => {
     if (event.key === 'ArrowRight' && index < cards.length - 1) show(index + 1);
     if (event.key === 'ArrowDown') setInfoVisible(info.hidden);
   });
-})();
-`
+
+  openFromLocation();
+})();`

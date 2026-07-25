@@ -387,3 +387,143 @@ func TestLightboxHoverHints(t *testing.T) {
 		}
 	}
 }
+
+func TestDeepLinkingAndCopyLinkSupport(t *testing.T) {
+	checks := []string{
+		`data-media-id="{{.MediaID}}"`,
+		`history.replaceState(null, '', currentShareURL())`,
+		`location.pathname + location.search`,
+		`window.addEventListener('hashchange', openFromLocation)`,
+		`navigator.clipboard.writeText(currentShareURL())`,
+		`hash = 'media=' + encodeURIComponent(currentMediaID())`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(pageTemplate+galaJS, check) {
+			t.Fatalf("deep linking implementation missing %q", check)
+		}
+	}
+}
+
+func TestEncodeExifData(t *testing.T) {
+	data := encodeExifData(&ExifInfo{Camera: "Canon", Aperture: "f/2.8"})
+	for _, check := range []string{`"camera":"Canon"`, `"aperture":"f/2.8"`} {
+		if !strings.Contains(data, check) {
+			t.Fatalf("encoded exif missing %q in %q", check, data)
+		}
+	}
+}
+
+func TestNormalizeExifInfo(t *testing.T) {
+	info := normalizeExifInfo(map[string]any{
+		"Make":                 "Canon",
+		"Model":                "EOS R6",
+		"LensModel":            "RF24-105mm F4 L IS USM",
+		"DateTimeOriginal":     "2026:07:25 21:22:23",
+		"ExposureTime":         "1/125",
+		"FNumber":              5.6,
+		"ISO":                  400,
+		"FocalLength":          50,
+		"ExposureCompensation": "+0.3",
+	})
+	if info == nil {
+		t.Fatal("expected EXIF info")
+	}
+	if info.Camera != "Canon EOS R6" {
+		t.Fatalf("camera = %q", info.Camera)
+	}
+	if info.Aperture != "f/5.6" {
+		t.Fatalf("aperture = %q", info.Aperture)
+	}
+	if info.CaptureTime != "2026-07-25 21:22:23" {
+		t.Fatalf("capture time = %q", info.CaptureTime)
+	}
+	if info.FocalLength != "50 mm" {
+		t.Fatalf("focal length = %q", info.FocalLength)
+	}
+}
+
+func TestWritePagesIncludesExifData(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "originals")
+	output := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "photo.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirs, files, err := scanTree(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	images := map[string]ManifestImage{
+		"photo.jpg": {
+			Size: 1, ModNano: 1,
+			Thumb: "_gala/thumbs/photo.jpg", Preview: "_gala/previews/photo.jpg",
+			Width: 4000, Height: 3000,
+			ExifReady: true,
+			Exif:      &ExifInfo{Camera: "Canon EOS R6", Aperture: "f/5.6"},
+		},
+	}
+	if _, err := writePages(source, output, Options{ThumbSize: 320, PreviewSize: 1920}, dirs, files, images, nil); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(filepath.Join(output, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(html)
+	for _, check := range []string{`data-exif=`, `Canon EOS R6`, `data-media-id=`} {
+		if !strings.Contains(page, check) {
+			t.Fatalf("page missing %q", check)
+		}
+	}
+}
+
+func TestWithImageName(t *testing.T) {
+	if got := withImageName("preview.jpg?v=abc", "dir/one photo.jpg"); got != "preview.jpg?v=abc&imagename=one+photo.jpg" {
+		t.Fatalf("unexpected imagename URL %q", got)
+	}
+	if got := withImageName("preview.jpg", "one.jpg"); got != "preview.jpg?imagename=one.jpg" {
+		t.Fatalf("unexpected imagename URL without prior query %q", got)
+	}
+}
+
+func TestPreviewURLsIncludeImageName(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "originals")
+	output := filepath.Join(t.TempDir(), "site")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "one.jpg"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirs, files, err := scanTree(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	images := map[string]ManifestImage{
+		"one.jpg": {Size: 1, ModNano: 1, Thumb: "_gala/thumbs/one.jpg", Preview: "_gala/previews/one.jpg", Width: 10, Height: 10},
+	}
+	if _, err := writePages(source, output, Options{ThumbSize: 320, PreviewSize: 1920}, dirs, files, images, nil); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(filepath.Join(output, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), "imagename=one.jpg") {
+		t.Fatalf("preview URL does not contain image name: %s", string(html))
+	}
+}
+
+func TestExifStringNilIsEmpty(t *testing.T) {
+	if got := exifString(nil); got != "" {
+		t.Fatalf("exifString(nil) = %q, want empty string", got)
+	}
+}
+
+func TestNormalizeExifInfoWithMissingFieldsIsNil(t *testing.T) {
+	if info := normalizeExifInfo(map[string]any{}); info != nil {
+		t.Fatalf("empty EXIF row produced %#v", info)
+	}
+}
