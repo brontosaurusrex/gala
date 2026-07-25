@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
@@ -21,16 +22,18 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const version = "0.1.4"
+const version = "0.1.5"
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -38,6 +41,15 @@ var imageExtensions = map[string]bool{
 
 var videoExtensions = map[string]bool{
 	".mp4": true, ".m4v": true, ".mov": true, ".webm": true, ".mkv": true,
+}
+
+var rawExtensions = map[string]bool{
+	".3fr": true, ".arw": true, ".cr2": true, ".cr3": true,
+	".dng": true, ".erf": true, ".fff": true, ".iiq": true,
+	".kdc": true, ".mef": true, ".mos": true, ".mrw": true,
+	".nef": true, ".nrw": true, ".orf": true, ".pef": true,
+	".raf": true, ".raw": true, ".rwl": true, ".rw2": true,
+	".sr2": true, ".srf": true, ".srw": true, ".x3f": true,
 }
 
 type Options struct {
@@ -111,7 +123,16 @@ type FolderCard struct {
 	Href     string
 	ThumbURL string
 	HasThumb bool
+	Virtual  bool
 	Count    int
+}
+
+type Dependencies struct {
+	FFmpeg     string
+	PDFToCairo string
+	ExifTool   string
+	DCRaw      string
+	Magick     string
 }
 
 type ImageCard struct {
@@ -147,16 +168,27 @@ type PageData struct {
 }
 
 func main() {
+	os.Exit(realMain())
+}
+
+func realMain() int {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gala:", err)
 		fmt.Fprintln(os.Stderr, "Try 'gala --help'.")
-		os.Exit(2)
+		return 2
 	}
-	if err := run(opts); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runContext(ctx, opts); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "Gala: interrupted; temporary state and build lock cleaned up")
+			return 130
+		}
 		fmt.Fprintln(os.Stderr, "gala:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func parseArgs(args []string) (Options, error) {
@@ -274,6 +306,10 @@ relative links from generated pages to the source tree.
 }
 
 func run(opts Options) error {
+	return runContext(context.Background(), opts)
+}
+
+func runContext(ctx context.Context, opts Options) error {
 	source, err := filepath.Abs(opts.Source)
 	if err != nil {
 		return err
@@ -296,10 +332,11 @@ func run(opts Options) error {
 		return errors.New("source and output directories must be different")
 	}
 
-	dirs, files, err := scanTree(source)
+	dirs, files, err := scanTreeContext(ctx, source)
 	if err != nil {
 		return err
 	}
+	deps := detectDependencies()
 
 	manifestPath := filepath.Join(output, ".gala-manifest.json")
 	oldManifest := loadManifest(manifestPath)
@@ -316,6 +353,7 @@ func run(opts Options) error {
 
 	jobs := make([]imageJob, 0)
 	newImages := make(map[string]ManifestImage, len(previewFiles))
+	skippedByDependency := make(map[string]int)
 	for _, f := range previewFiles {
 		old, ok := oldManifest.Images[f.Rel]
 		cacheCompatible := oldManifest.ThumbSize == opts.ThumbSize &&
@@ -324,10 +362,13 @@ func run(opts Options) error {
 			manifestAssetsExist(output, f.Kind, old)
 		if unchanged && !opts.Force {
 			newImages[f.Rel] = old
+		} else if !deps.canPreview(f.Kind) {
+			skippedByDependency[f.Kind]++
 		} else {
 			jobs = append(jobs, imageJob{File: f, Old: old})
 		}
 	}
+	reportMissingDependencies(skippedByDependency, deps)
 
 	fmt.Printf("Gala: %d directories, %d files, %d previewable media, %d item%s to process\n",
 		len(dirs), len(files), len(previewFiles), len(jobs), plural(len(jobs)))
@@ -349,15 +390,21 @@ func run(opts Options) error {
 		return err
 	}
 
-	results := processImages(jobs, output, opts)
+	results := processImages(ctx, jobs, output, opts, deps)
 	failures := 0
 	for r := range results {
 		if r.Err != nil {
+			if errors.Is(r.Err, context.Canceled) && ctx.Err() != nil {
+				continue
+			}
 			failures++
 			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", r.Rel, r.Err)
 			continue
 		}
 		newImages[r.Rel] = r.Entry
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := writeStaticAssets(output); err != nil {
@@ -365,6 +412,9 @@ func run(opts Options) error {
 	}
 
 	folderCover := chooseFolderCovers(dirs, files, newImages)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	pages, err := writePages(source, output, opts, dirs, files, newImages, folderCover)
 	if err != nil {
 		return err
@@ -373,7 +423,7 @@ func run(opts Options) error {
 	cleanupStale(output, oldManifest, newImages, pages)
 
 	manifest := Manifest{
-		Version:     5,
+		Version:     6,
 		Source:      source,
 		ThumbSize:   opts.ThumbSize,
 		PreviewSize: opts.PreviewSize,
@@ -398,19 +448,52 @@ func acquireLock(output string) (func(), error) {
 		return nil, err
 	}
 	path := filepath.Join(output, ".gala.lock")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("another Gala build appears to be running (remove %s if it is stale)", path)
+	for attempt := 0; attempt < 3; attempt++ {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+			if err := f.Close(); err != nil {
+				_ = os.Remove(path)
+				return nil, err
+			}
+			return func() { _ = os.Remove(path) }, nil
 		}
-		return nil, err
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+
+		pid, readErr := lockPID(path)
+		if readErr == nil && processAlive(pid) {
+			return nil, fmt.Errorf("another Gala build is running with PID %d", pid)
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("remove stale lock %s: %w", path, removeErr)
+		}
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: removed unreadable stale lock %s\n", path)
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: removed stale Gala lock for PID %d\n", pid)
+		}
 	}
-	_, _ = fmt.Fprintf(f, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return nil, err
+	return nil, fmt.Errorf("could not acquire build lock %s", path)
+}
+
+func lockPID(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
 	}
-	return func() { _ = os.Remove(path) }, nil
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "pid=") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid=")))
+		if err != nil || pid < 1 {
+			return 0, errors.New("invalid PID in lock file")
+		}
+		return pid, nil
+	}
+	return 0, errors.New("lock file has no PID")
 }
 
 func plural(n int) string {
@@ -418,6 +501,53 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+func detectDependencies() Dependencies {
+	return Dependencies{
+		FFmpeg:     findCommand("ffmpeg"),
+		PDFToCairo: findCommand("pdftocairo"),
+		ExifTool:   findCommand("exiftool"),
+		DCRaw:      findCommand("dcraw"),
+		Magick:     findCommand("magick", "convert"),
+	}
+}
+
+func findCommand(names ...string) string {
+	for _, name := range names {
+		path, err := exec.LookPath(name)
+		if err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func (d Dependencies) canPreview(kind string) bool {
+	switch kind {
+	case "image":
+		return true
+	case "video":
+		return d.FFmpeg != ""
+	case "pdf":
+		return d.PDFToCairo != ""
+	case "raw":
+		return d.ExifTool != "" || d.DCRaw != "" || d.Magick != ""
+	default:
+		return false
+	}
+}
+
+func reportMissingDependencies(skipped map[string]int, deps Dependencies) {
+	if n := skipped["video"]; n > 0 {
+		fmt.Fprintf(os.Stderr, "warning: ffmpeg not found; %d video file%s will be shown as direct download%s\n", n, plural(n), plural(n))
+	}
+	if n := skipped["pdf"]; n > 0 {
+		fmt.Fprintf(os.Stderr, "warning: pdftocairo not found; %d PDF file%s will be shown as direct download%s\n", n, plural(n), plural(n))
+	}
+	if n := skipped["raw"]; n > 0 {
+		fmt.Fprintf(os.Stderr, "warning: no RAW preview helper found; install exiftool, dcraw, or ImageMagick (%d RAW file%s shown as direct download%s)\n", n, plural(n), plural(n))
+	}
 }
 
 func sameOrInside(path, root string) bool {
@@ -429,10 +559,17 @@ func sameOrInside(path, root string) bool {
 }
 
 func scanTree(source string) (map[string]*dirData, []ScanFile, error) {
+	return scanTreeContext(context.Background(), source)
+}
+
+func scanTreeContext(ctx context.Context, source string) (map[string]*dirData, []ScanFile, error) {
 	dirs := map[string]*dirData{"": {Rel: ""}}
 	var files []ScanFile
 
 	err := filepath.WalkDir(source, func(path string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -479,6 +616,9 @@ func scanTree(source string) (map[string]*dirData, []ScanFile, error) {
 		} else if ext == ".pdf" {
 			kind = "pdf"
 			isPreviewable = true
+		} else if rawExtensions[ext] {
+			kind = "raw"
+			isPreviewable = true
 		}
 		f := ScanFile{
 			Rel: rel, Abs: path, DirRel: dirRel, Name: name, Ext: ext,
@@ -517,7 +657,7 @@ func loadManifest(path string) Manifest {
 	return m
 }
 
-func processImages(jobs []imageJob, output string, opts Options) <-chan imageResult {
+func processImages(ctx context.Context, jobs []imageJob, output string, opts Options, deps Dependencies) <-chan imageResult {
 	jobCh := make(chan imageJob)
 	resultCh := make(chan imageResult)
 	var wg sync.WaitGroup
@@ -534,26 +674,44 @@ func processImages(jobs []imageJob, output string, opts Options) <-chan imageRes
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
-				entry, err := generateImageAssets(job.File, output, opts)
-				resultCh <- imageResult{Rel: job.File.Rel, Entry: entry, Err: err}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobCh:
+					if !ok {
+						return
+					}
+					entry, err := generateImageAssets(ctx, job.File, output, opts, deps)
+					select {
+					case resultCh <- imageResult{Rel: job.File.Rel, Entry: entry, Err: err}:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}()
 	}
 
 	go func() {
+		defer close(jobCh)
 		for _, job := range jobs {
-			jobCh <- job
+			select {
+			case jobCh <- job:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(jobCh)
+	}()
+	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
 	return resultCh
 }
 
-func generateImageAssets(f ScanFile, output string, opts Options) (ManifestImage, error) {
-	img, format, err := decodePreviewSource(f, output, opts.PreviewSize)
+func generateImageAssets(ctx context.Context, f ScanFile, output string, opts Options, deps Dependencies) (ManifestImage, error) {
+	img, format, err := decodePreviewSource(ctx, f, output, opts.PreviewSize, deps)
 	if err != nil {
 		return ManifestImage{}, err
 	}
@@ -593,7 +751,7 @@ func generateImageAssets(f ScanFile, output string, opts Options) (ManifestImage
 	}, nil
 }
 
-func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Image, string, error) {
+func decodePreviewSource(ctx context.Context, f ScanFile, output string, previewSize int, deps Dependencies) (image.Image, string, error) {
 	if f.IsImage {
 		in, err := os.Open(f.Abs)
 		if err != nil {
@@ -606,6 +764,9 @@ func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Imag
 		}
 		return img, format, nil
 	}
+	if f.Kind == "raw" {
+		return decodeRAWPreview(ctx, f, previewSize, deps)
+	}
 
 	tmpDir, err := os.MkdirTemp(filepath.Join(output, "_gala"), ".render-*")
 	if err != nil {
@@ -617,7 +778,7 @@ func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Imag
 	var sourceType string
 	switch f.Kind {
 	case "video":
-		if _, err := exec.LookPath("ffmpeg"); err != nil {
+		if deps.FFmpeg == "" {
 			return nil, "", errors.New("ffmpeg is required for video previews")
 		}
 		rendered = filepath.Join(tmpDir, "frame.jpg")
@@ -627,20 +788,20 @@ func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Imag
 			"-vf", "thumbnail=100",
 			"-frames:v", "1", "-q:v", "2", rendered,
 		}
-		if err := runExternal(3*time.Minute, "ffmpeg", args...); err != nil {
+		if err := runExternal(ctx, 3*time.Minute, deps.FFmpeg, args...); err != nil {
 			fallback := []string{
 				"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 				"-ss", "1", "-i", f.Abs,
 				"-frames:v", "1", "-q:v", "2", rendered,
 			}
-			if fallbackErr := runExternal(3*time.Minute, "ffmpeg", fallback...); fallbackErr != nil {
+			if fallbackErr := runExternal(ctx, 3*time.Minute, deps.FFmpeg, fallback...); fallbackErr != nil {
 				return nil, "", fmt.Errorf("ffmpeg thumbnail: %v; fallback: %w", err, fallbackErr)
 			}
 		}
 		sourceType = "video/" + strings.TrimPrefix(f.Ext, ".")
 
 	case "pdf":
-		if _, err := exec.LookPath("pdftocairo"); err != nil {
+		if deps.PDFToCairo == "" {
 			return nil, "", errors.New("pdftocairo is required for PDF previews")
 		}
 		prefix := filepath.Join(tmpDir, "page")
@@ -650,7 +811,7 @@ func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Imag
 			"-scale-to", strconv.Itoa(previewSize),
 			f.Abs, prefix,
 		}
-		if err := runExternal(2*time.Minute, "pdftocairo", args...); err != nil {
+		if err := runExternal(ctx, 2*time.Minute, deps.PDFToCairo, args...); err != nil {
 			return nil, "", fmt.Errorf("pdftocairo: %w", err)
 		}
 		sourceType = "application/pdf"
@@ -671,22 +832,88 @@ func decodePreviewSource(f ScanFile, output string, previewSize int) (image.Imag
 	return img, sourceType, nil
 }
 
-func runExternal(timeout time.Duration, name string, args ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func decodeRAWPreview(ctx context.Context, f ScanFile, previewSize int, deps Dependencies) (image.Image, string, error) {
+	var attempts []string
+	decodeOutput := func(label string, output []byte, err error) (image.Image, bool) {
+		if err != nil {
+			attempts = append(attempts, label+": "+err.Error())
+			return nil, false
+		}
+		if len(output) == 0 {
+			attempts = append(attempts, label+": no embedded image")
+			return nil, false
+		}
+		img, _, decodeErr := image.Decode(bytes.NewReader(output))
+		if decodeErr != nil {
+			attempts = append(attempts, label+": "+decodeErr.Error())
+			return nil, false
+		}
+		img = orientImage(img, jpegOrientationReader(bytes.NewReader(output)))
+		return img, true
+	}
+
+	if deps.ExifTool != "" {
+		for _, tag := range []string{"PreviewImage", "JpgFromRaw", "OtherImage", "ThumbnailImage"} {
+			output, err := runExternalOutput(ctx, 90*time.Second, deps.ExifTool, "-b", "-"+tag, f.Abs)
+			if img, ok := decodeOutput("exiftool "+tag, output, err); ok {
+				return img, "image/x-raw", nil
+			}
+		}
+	}
+
+	if deps.DCRaw != "" {
+		output, err := runExternalOutput(ctx, 3*time.Minute, deps.DCRaw, "-e", "-c", f.Abs)
+		if img, ok := decodeOutput("dcraw embedded preview", output, err); ok {
+			return img, "image/x-raw", nil
+		}
+	}
+
+	if deps.Magick != "" {
+		geometry := fmt.Sprintf("%dx%d>", previewSize, previewSize)
+		output, err := runExternalOutput(ctx, 5*time.Minute, deps.Magick,
+			"-quiet", f.Abs, "-auto-orient", "-thumbnail", geometry, "jpg:-")
+		if img, ok := decodeOutput("ImageMagick RAW render", output, err); ok {
+			return img, "image/x-raw", nil
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(attempts) == 0 {
+		return nil, "", errors.New("no RAW preview helper is installed")
+	}
+	return nil, "", fmt.Errorf("RAW preview failed: %s", strings.Join(attempts, "; "))
+}
+
+func runExternal(ctx context.Context, timeout time.Duration, name string, args ...string) error {
+	_, err := runExternalOutput(ctx, timeout, name, args...)
+	return err
+}
+
+func runExternalOutput(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("timed out after %s", timeout)
+	cmd := exec.CommandContext(commandCtx, name, args...)
+	output, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if commandCtx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("timed out after %s", timeout)
 	}
 	if err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			return err
+		message := ""
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			message = strings.TrimSpace(string(exitErr.Stderr))
 		}
-		return fmt.Errorf("%w: %s", err, message)
+		if message == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %s", err, message)
 	}
-	return nil
+	return output, nil
 }
 
 func shortHash(s string) string {
@@ -821,7 +1048,7 @@ func replaceFile(tmp, target string) error {
 func chooseFolderCovers(dirs map[string]*dirData, files []ScanFile, images map[string]ManifestImage) map[string]string {
 	covers := make(map[string]string)
 	for _, f := range files {
-		if !f.IsImage {
+		if f.Kind != "image" && f.Kind != "raw" {
 			continue
 		}
 		if _, ok := images[f.Rel]; !ok {
@@ -914,9 +1141,10 @@ func writePages(source, output string, opts Options, dirs map[string]*dirData, f
 
 		if rel == "" && len(videos) > 0 {
 			collection := FolderCard{
-				Name:  "Videos",
-				Href:  webRel(pageDir, videoCollectionIndex),
-				Count: len(videos),
+				Name:    "Videos",
+				Href:    webRel(pageDir, videoCollectionIndex),
+				Count:   len(videos),
+				Virtual: true,
 			}
 			for _, videoFile := range videos {
 				if entry, ok := images[videoFile.Rel]; ok {
@@ -993,6 +1221,8 @@ func makeImageCard(source, output, pageDir string, opts Options, f ScanFile, ent
 		posterURL = mediumURL
 	case "pdf":
 		badge = "PDF"
+	case "raw":
+		badge = "RAW"
 	}
 
 	return ImageCard{
@@ -1211,18 +1441,22 @@ func jpegOrientation(path string) int {
 		return 1
 	}
 	defer f.Close()
+	return jpegOrientationReader(f)
+}
+
+func jpegOrientationReader(r io.Reader) int {
 	var soi [2]byte
-	if _, err := io.ReadFull(f, soi[:]); err != nil || soi != [2]byte{0xff, 0xd8} {
+	if _, err := io.ReadFull(r, soi[:]); err != nil || soi != [2]byte{0xff, 0xd8} {
 		return 1
 	}
 	for {
 		var marker [2]byte
-		if _, err := io.ReadFull(f, marker[:]); err != nil {
+		if _, err := io.ReadFull(r, marker[:]); err != nil {
 			return 1
 		}
 		for marker[0] != 0xff {
 			marker[0] = marker[1]
-			if _, err := io.ReadFull(f, marker[1:]); err != nil {
+			if _, err := io.ReadFull(r, marker[1:]); err != nil {
 				return 1
 			}
 		}
@@ -1233,7 +1467,7 @@ func jpegOrientation(path string) int {
 			continue
 		}
 		var lenBuf [2]byte
-		if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			return 1
 		}
 		segLen := int(binary.BigEndian.Uint16(lenBuf[:])) - 2
@@ -1241,7 +1475,7 @@ func jpegOrientation(path string) int {
 			return 1
 		}
 		data := make([]byte, segLen)
-		if _, err := io.ReadFull(f, data); err != nil {
+		if _, err := io.ReadFull(r, data); err != nil {
 			return 1
 		}
 		if marker[1] == 0xe1 && len(data) > 14 && string(data[:6]) == "Exif\x00\x00" {
@@ -1354,10 +1588,14 @@ const pageTemplate = `<!doctype html>
     <h2 id="folders-heading">Folders</h2>
     <div class="grid">
       {{range .Folders}}
-      <a class="card folder-card" href="{{.Href}}">
+      <a class="card folder-card{{if .Virtual}} virtual-folder-card{{end}}" href="{{.Href}}">
         <div class="thumb folder-thumb">
           {{if .HasThumb}}<img src="{{.ThumbURL}}" alt="" loading="lazy">{{else}}<div class="folder-placeholder">G</div>{{end}}
+          {{if .Virtual}}
+          <span class="folder-badge virtual-folder-badge" aria-hidden="true"><svg viewBox="0 0 24 24"><path class="collection-back" d="M5 3h12a2 2 0 0 1 2 2v1H7a3 3 0 0 0-3 3v8H3a2 2 0 0 1-2-2V7a4 4 0 0 1 4-4z"/><path class="collection-front" d="M7 7h12a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-8a3 3 0 0 1 3-3z"/><path class="collection-play" d="m11 11 5 3-5 3z"/></svg></span>
+          {{else}}
           <span class="folder-badge" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a3 3 0 0 1-3 3H5a2 2 0 0 1-2-2V5z"/></svg></span>
+          {{end}}
         </div>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Count}} item{{if ne .Count 1}}s{{end}}</span></div>
       </a>
@@ -1404,8 +1642,10 @@ const pageTemplate = `<!doctype html>
   <button class="close" type="button" aria-label="Close">×</button>
   <button class="nav prev" type="button" aria-label="Previous" {{if lt (len .Images) 2}}hidden{{end}}>‹</button>
   <div class="lightbox-stage" title="Click the top area to close">
+    <span class="lightbox-hint exit-hint" aria-hidden="true">Click to exit</span>
     <img class="lightbox-image" alt="">
     <video class="lightbox-video" controls preload="metadata" hidden></video>
+    <span class="lightbox-hint download-hint" aria-hidden="true">Click for download</span>
   </div>
   <button class="nav next" type="button" aria-label="Next" {{if lt (len .Images) 2}}hidden{{end}}>›</button>
   <div class="lightbox-info" hidden>
@@ -1425,6 +1665,7 @@ const galaCSS = `:root {
   --muted: #9ca6b5;
   --accent: #e9b44c;
   --folder: #4f9ddf;
+  --virtual-folder: #a86de0;
   --gap: clamp(.75rem, 2vw, 1.25rem);
   --info-height: 0px;
 }
@@ -1448,6 +1689,11 @@ h2 { margin: 2rem 0 .9rem; color: var(--muted); font-size: .8rem; letter-spacing
 .folder-badge, .media-badge { position: absolute; right: .65rem; bottom: .65rem; display: grid; place-items: center; min-width: 2.3rem; height: 2.3rem; padding: 0 .55rem; border-radius: 999px; box-shadow: 0 6px 18px #0008; color: white; font: 800 .7rem system-ui, sans-serif; }
 .folder-badge { width: 2.3rem; padding: 0; background: var(--folder); }
 .folder-badge svg { width: 1.35rem; fill: white; }
+.virtual-folder-badge { background: var(--virtual-folder); }
+.virtual-folder-badge svg { width: 1.5rem; }
+.virtual-folder-badge .collection-back { opacity: .55; }
+.virtual-folder-badge .collection-front { fill: white; }
+.virtual-folder-badge .collection-play { fill: var(--virtual-folder); }
 .media-badge { background: #10131ad9; border: 1px solid #ffffff35; backdrop-filter: blur(5px); }
 .video .media-badge { min-width: auto; height: auto; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; backdrop-filter: none; font-size: 2rem; line-height: 1; text-shadow: 0 4px 12px #000; }
 .pdf .media-badge { color: #ffb2aa; }
@@ -1471,6 +1717,10 @@ footer:hover span { opacity: 1; }
 .lightbox-image, .lightbox-video { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 55px #000); user-select: none; -webkit-user-drag: none; }
 .lightbox-image[hidden], .lightbox-video[hidden] { display: none; }
 .lightbox-video { background: #000; cursor: default; }
+.lightbox-hint { position: absolute; z-index: 5; left: 50%; translate: -50% 0; padding: .5rem .8rem; border-radius: 999px; background: #050609c9; border: 1px solid #ffffff25; color: #fff; font-size: .78rem; font-weight: 700; letter-spacing: .02em; opacity: 0; transform: translateY(-4px); transition: opacity .12s ease, transform .12s ease; pointer-events: none; }
+.lightbox-hint.visible { opacity: 1; transform: translateY(0); }
+.exit-hint { top: .8rem; }
+.download-hint { bottom: 1rem; }
 .close, .nav { position: absolute; z-index: 3; border: 0; color: white; background: #0007; cursor: pointer; }
 .close { right: .75rem; top: .75rem; width: 3.2rem; height: 3.2rem; border-radius: 50%; font-size: 2.2rem; line-height: 1; }
 .nav { top: 45%; width: 3rem; height: 4rem; font-size: 3rem; border-radius: 9px; }
@@ -1490,6 +1740,9 @@ footer:hover span { opacity: 1; }
   .lightbox-info { align-items: stretch; flex-direction: column; }
   .download-link { text-align: center; }
 }
+@media (hover: none) {
+  .lightbox-hint { display: none; }
+}
 `
 
 const galaJS = `(() => {
@@ -1507,6 +1760,8 @@ const galaJS = `(() => {
   const closeButton = box.querySelector('.close');
   const previousButton = box.querySelector('.prev');
   const nextButton = box.querySelector('.next');
+  const exitHint = box.querySelector('.exit-hint');
+  const downloadHint = box.querySelector('.download-hint');
   const hasMultiple = cards.length > 1;
   let index = 0;
   let currentKind = '';
@@ -1527,6 +1782,11 @@ const galaJS = `(() => {
   function updateNavigation() {
     previousButton.hidden = !hasMultiple || index === 0;
     nextButton.hidden = !hasMultiple || index === cards.length - 1;
+  }
+
+  function hideHints() {
+    exitHint.classList.remove('visible');
+    downloadHint.classList.remove('visible');
   }
 
   function show(i) {
@@ -1550,6 +1810,7 @@ const galaJS = `(() => {
     name.textContent = card.dataset.name || '';
     dimensions.textContent = card.dataset.dimensions || '';
     download.href = card.dataset.original;
+    hideHints();
     updateNavigation();
   }
 
@@ -1560,6 +1821,7 @@ const galaJS = `(() => {
       box.style.setProperty('--info-height', '0px');
       return;
     }
+    downloadHint.classList.remove('visible');
     requestAnimationFrame(() => {
       box.style.setProperty('--info-height', info.offsetHeight + 'px');
     });
@@ -1581,6 +1843,7 @@ const galaJS = `(() => {
     image.hidden = false;
     stopVideo();
     currentKind = '';
+    hideHints();
     document.body.style.overflow = '';
   }
 
@@ -1598,6 +1861,18 @@ const galaJS = `(() => {
     event.stopPropagation();
     if (index < cards.length - 1) show(index + 1);
   });
+
+  stage.addEventListener('mousemove', event => {
+    const media = activeMedia();
+    const mediaRect = media.getBoundingClientRect();
+    const closeBand = Math.max(44, Math.min(90, mediaRect.height * 0.12));
+    const topOfMedia = event.clientY >= mediaRect.top && event.clientY <= mediaRect.top + closeBand;
+    const lowerZone = event.clientY > window.innerHeight * 0.72;
+    const overVideoControls = currentKind === 'video' && event.target === video;
+    exitHint.classList.toggle('visible', topOfMedia || event.clientY < 56);
+    downloadHint.classList.toggle('visible', lowerZone && info.hidden && !overVideoControls);
+  });
+  stage.addEventListener('mouseleave', hideHints);
 
   stage.addEventListener('click', event => {
     const media = activeMedia();

@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEscapeRelURL(t *testing.T) {
@@ -58,6 +62,19 @@ func TestAcquireLock(t *testing.T) {
 	}
 }
 
+func TestAcquireLockRemovesStalePID(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, ".gala.lock")
+	if err := os.WriteFile(lock, []byte("pid=99999999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+}
+
 func TestDefaultPreviewSize(t *testing.T) {
 	opts, err := parseArgs([]string{"./originals"})
 	if err != nil {
@@ -78,7 +95,7 @@ func TestPortraitPreviewFitsWithinMaximum(t *testing.T) {
 
 func TestScanTreeClassifiesPreviewableMedia(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"photo.jpg", "movie.mp4", "paper.pdf", "notes.txt"} {
+	for _, name := range []string{"photo.jpg", "movie.mp4", "paper.pdf", "camera.cr2", "notes.txt"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -99,6 +116,7 @@ func TestScanTreeClassifiesPreviewableMedia(t *testing.T) {
 		{"photo.jpg", "image", true},
 		{"movie.mp4", "video", true},
 		{"paper.pdf", "pdf", true},
+		{"camera.cr2", "raw", true},
 		{"notes.txt", "file", false},
 	}
 	for _, tc := range cases {
@@ -251,6 +269,9 @@ func TestVirtualVideosCollection(t *testing.T) {
 	if !strings.Contains(string(rootHTML), `href="_gala/collections/videos/index.html"`) {
 		t.Fatal("root page does not link to the virtual Videos collection")
 	}
+	if !strings.Contains(string(rootHTML), `class="card folder-card virtual-folder-card"`) {
+		t.Fatal("virtual Videos collection is not styled distinctly")
+	}
 
 	collectionHTML, err := os.ReadFile(filepath.Join(output, "_gala", "collections", "videos", "index.html"))
 	if err != nil {
@@ -264,6 +285,105 @@ func TestVirtualVideosCollection(t *testing.T) {
 	} {
 		if !strings.Contains(collection, check) {
 			t.Fatalf("Videos collection missing %q", check)
+		}
+	}
+}
+
+func TestRAWPreviewUsesExifToolEmbeddedImage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell helper test")
+	}
+	dir := t.TempDir()
+	previewPath := filepath.Join(dir, "preview.jpg")
+	f, err := os.Create(previewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 80, 120))
+	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(dir, "exiftool")
+	script := "#!/bin/sh\ncat " + previewPath + "\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rawPath := filepath.Join(dir, "photo.cr2")
+	if err := os.WriteFile(rawPath, []byte("not a real RAW"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, sourceType, err := decodeRAWPreview(context.Background(), ScanFile{Abs: rawPath, Ext: ".cr2"}, 1920, Dependencies{ExifTool: helper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bounds().Dx() != 80 || got.Bounds().Dy() != 120 {
+		t.Fatalf("RAW preview bounds = %v", got.Bounds())
+	}
+	if sourceType != "image/x-raw" {
+		t.Fatalf("source type = %q", sourceType)
+	}
+}
+
+func TestCancellationRemovesBuildLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell helper test")
+	}
+	source := filepath.Join(t.TempDir(), "originals")
+	output := filepath.Join(t.TempDir(), "site")
+	bin := t.TempDir()
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "slow.cr2"), []byte("raw"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(bin, "exiftool")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runContext(ctx, Options{Source: source, Output: output, Workers: 1, ThumbSize: 320, PreviewSize: 1920})
+	}()
+
+	lock := filepath.Join(output, ".gala.lock")
+	deadline := time.Now().Add(3 * time.Second)
+	for !fileExists(lock) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fileExists(lock) {
+		t.Fatal("build lock was not created")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "canceled") {
+			t.Fatalf("runContext error = %v, want cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled build did not stop")
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("lock remains after cancellation: %v", err)
+	}
+}
+
+func TestLightboxHoverHints(t *testing.T) {
+	for _, check := range []string{
+		`class="lightbox-hint exit-hint"`,
+		`Click to exit`,
+		`class="lightbox-hint download-hint"`,
+		`Click for download`,
+		`stage.addEventListener('mousemove'`,
+	} {
+		if !strings.Contains(pageTemplate+galaJS, check) {
+			t.Fatalf("lightbox hover hint implementation missing %q", check)
 		}
 	}
 }
