@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -33,7 +34,10 @@ import (
 	"time"
 )
 
-const version = "0.1.9"
+const version = "0.1.12"
+
+//go:embed assets/InterVariable.woff2
+var interVariableWOFF2 []byte
 
 var imageExtensions = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
@@ -1496,6 +1500,12 @@ func writeStaticAssets(output string) error {
 	if err := os.MkdirAll(assetDir, 0o755); err != nil {
 		return err
 	}
+	if len(interVariableWOFF2) == 0 {
+		return errors.New("embedded InterVariable.woff2 is empty")
+	}
+	if err := writeBytesAtomic(filepath.Join(assetDir, "InterVariable.woff2"), interVariableWOFF2, 0o644); err != nil {
+		return err
+	}
 	if err := writeBytesAtomic(filepath.Join(assetDir, "gala.css"), []byte(galaCSS), 0o644); err != nil {
 		return err
 	}
@@ -1750,10 +1760,12 @@ const pageTemplate = `<!doctype html>
     <h2 id="media-heading">Media</h2>
     <div class="grid image-grid">
       {{range .Images}}
-      <a class="card media-card {{.Kind}}" href="{{.PreviewURL}}" data-kind="{{.Kind}}" data-media-id="{{.MediaID}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-filename="{{.FileName}}" data-dimensions="{{.Width}} × {{.Height}}" data-exif='{{.ExifJSON}}'>
-        <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
+      <article class="card media-card {{.Kind}}" data-kind="{{.Kind}}" data-media-id="{{.MediaID}}" data-preview="{{.PreviewURL}}" data-poster="{{.PosterURL}}" data-original="{{.OriginalURL}}" data-name="{{.Name}}" data-filename="{{.FileName}}" data-dimensions="{{.Width}} × {{.Height}}" data-exif='{{.ExifJSON}}'>
+        <a class="media-open" href="{{.PreviewURL}}" aria-label="Open {{.Name}}">
+          <div class="thumb"><img src="{{.ThumbURL}}" alt="{{.Name}}" loading="lazy">{{if .Badge}}<span class="media-badge" aria-hidden="true">{{.Badge}}</span>{{end}}</div>
+        </a>
         <div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>
-      </a>
+      </article>
       {{end}}
     </div>
   </section>
@@ -1804,7 +1816,14 @@ const pageTemplate = `<!doctype html>
 </html>
 `
 
-const galaCSS = `:root {
+const galaCSS = `@font-face {
+  font-family: "Inter";
+  src: url("InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+:root {
   --bg: #111318;
   --panel: #1b1f27;
   --panel-2: #252b36;
@@ -1817,7 +1836,7 @@ const galaCSS = `:root {
   --info-height: 0px;
 }
 * { box-sizing: border-box; }
-html { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
+html { background: var(--bg); color: var(--text); font-family: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; }
 body { margin: 0; min-height: 100vh; }
 a { color: inherit; text-decoration: none; }
 .site-header { position: sticky; top: 0; z-index: 10; padding: 1rem clamp(1rem, 4vw, 3rem); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px); }
@@ -1847,6 +1866,10 @@ h2 { margin: 2rem 0 .9rem; color: var(--muted); font-size: .8rem; letter-spacing
 .card-text { padding: .75rem .85rem .9rem; display: grid; gap: .2rem; }
 .card-text strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .92rem; }
 .card-text span { color: var(--muted); font-size: .78rem; }
+.media-open { display: block; }
+.media-card .card-text { padding: .5rem .65rem .6rem; user-select: text; -webkit-user-select: text; cursor: text; }
+.media-card .card-text strong { font-size: .72rem; font-weight: 600; }
+.media-card .card-text span { font-size: .64rem; }
 .file-list { display: grid; gap: .45rem; }
 .file-row { display: grid; grid-template-columns: 4rem minmax(0,1fr) auto; align-items: center; gap: .8rem; padding: .7rem; border-radius: 10px; background: var(--panel); border: 1px solid #ffffff0d; }
 .file-row:hover { border-color: #ffffff35; }
@@ -2082,10 +2105,14 @@ const galaJS = `(() => {
     else show(found);
   }
 
-  cards.forEach((card, i) => card.addEventListener('click', event => {
-    event.preventDefault();
-    open(i);
-  }));
+  cards.forEach((card, i) => {
+    const trigger = card.querySelector('.media-open');
+    if (!trigger) return;
+    trigger.addEventListener('click', event => {
+      event.preventDefault();
+      open(i);
+    });
+  });
 
   closeButton.addEventListener('click', close);
   previousButton.addEventListener('click', event => {

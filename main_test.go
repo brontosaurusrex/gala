@@ -527,3 +527,72 @@ func TestNormalizeExifInfoWithMissingFieldsIsNil(t *testing.T) {
 		t.Fatalf("empty EXIF row produced %#v", info)
 	}
 }
+
+func TestInterFontIsBundledAndUsed(t *testing.T) {
+	if len(interVariableWOFF2) == 0 {
+		t.Fatal("embedded Inter font is empty")
+	}
+	for _, check := range []string{
+		`@font-face`,
+		`font-family: "Inter";`,
+		`src: url("InterVariable.woff2") format("woff2");`,
+		`font-weight: 100 900;`,
+		`font-family: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;`,
+	} {
+		if !strings.Contains(galaCSS, check) {
+			t.Fatalf("Inter CSS integration missing %q", check)
+		}
+	}
+}
+
+func TestWriteStaticAssetsIncludesInterFont(t *testing.T) {
+	output := t.TempDir()
+	if err := writeStaticAssets(output); err != nil {
+		t.Fatal(err)
+	}
+	fontPath := filepath.Join(output, "_gala", "InterVariable.woff2")
+	font, err := os.ReadFile(fontPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(font) == 0 {
+		t.Fatal("generated Inter font is empty")
+	}
+	if string(font) != string(interVariableWOFF2) {
+		t.Fatal("generated font differs from embedded font")
+	}
+}
+
+func TestMediaCaptionIsSelectableAndSmaller(t *testing.T) {
+	checks := []string{
+		`.media-card .card-text { padding: .5rem .65rem .6rem; user-select: text; -webkit-user-select: text; cursor: text; }`,
+		`.media-card .card-text strong { font-size: .72rem; font-weight: 600; }`,
+		`.media-card .card-text span { font-size: .64rem; }`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(galaCSS+galaJS, check) {
+			t.Fatalf("selectable compact caption implementation missing %q", check)
+		}
+	}
+}
+
+func TestMediaCaptionIsOutsideLightboxLink(t *testing.T) {
+	openPos := strings.Index(pageTemplate, `<a class="media-open"`)
+	closePos := strings.Index(pageTemplate[openPos:], `</a>`)
+	captionPos := strings.Index(pageTemplate, `<div class="card-text"><strong>{{.Name}}</strong><span>{{.Width}} × {{.Height}}</span></div>`)
+	if openPos < 0 || closePos < 0 || captionPos < 0 {
+		t.Fatal("media link or caption markup missing")
+	}
+	closePos += openPos
+	if captionPos < closePos {
+		t.Fatal("media caption is still inside the lightbox anchor")
+	}
+	for _, check := range []string{
+		`const trigger = card.querySelector('.media-open')`,
+		`trigger.addEventListener('click'`,
+	} {
+		if !strings.Contains(galaJS, check) {
+			t.Fatalf("lightbox trigger implementation missing %q", check)
+		}
+	}
+}

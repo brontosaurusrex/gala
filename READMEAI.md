@@ -8,9 +8,12 @@ The source tree is never modified.
 
 This file is named `READMEAI.md` so you can keep your own `README.md` beside it.
 
-## Version 0.1.9
+## Version 0.1.12
 
 This version provides:
+
+- smaller selectable captions beneath media thumbnails;
+- the Inter variable WOFF2 webfont embedded into the Gala binary and generated site;
 
 - one generated `index.html` per source directory;
 - stable folder covers chosen from the first usable descendant image or RAW photo;
@@ -40,6 +43,27 @@ This version provides:
 - automatic recovery from lock files belonging to dead processes;
 - one clear dependency warning per affected media type instead of one warning per file;
 - JPEG EXIF-orientation correction.
+
+
+## Bundled Inter font
+
+Before building, place the normal Inter variable webfont at:
+
+```text
+assets/InterVariable.woff2
+```
+
+Gala embeds this file into the executable. Each generated site receives:
+
+```text
+gala-site/_gala/InterVariable.woff2
+```
+
+The generated CSS uses Inter first, followed by Segoe UI and the operating
+system's normal interface font. The gallery therefore works offline and through
+`file://` without requiring Inter to be installed on the viewer's computer.
+Retain Inter's SIL Open Font License when redistributing the font or a Gala
+binary containing it.
 
 ## Build
 
@@ -165,3 +189,5 @@ content remains separate, and originals are only opened for reading. Ctrl+C and
 SIGTERM cancel active helper processes and remove the build lock. A hard kill
 such as `kill -9` cannot run cleanup, so Gala checks the stored PID and removes
 the stale lock on the next run when that process no longer exists.
+
+- Media captions are outside the lightbox link, so filenames and dimensions can be selected normally.
